@@ -5,10 +5,9 @@ import calendar
 import numpy as np
 import sqlite3
 from functools import lru_cache
-from ortools.sat.python import cp_model
 import logging
 import time
-import math
+import random
 
 # Thiết lập logging
 logging.basicConfig(filename='schedule_debug.log', level=logging.DEBUG, 
@@ -124,23 +123,37 @@ def load_manual_shifts_from_db(month_days):
     conn.close()
     return manual_shifts
 
-# Hàm lưu giới hạn VX tối thiểu vào DB
-def save_vx_min_to_db(vx_min):
+# Hàm xóa dữ liệu lịch
+def clear_schedule_data(month_days):
+    st.session_state.schedule = {}
+    st.session_state.manual_shifts = {}
+    conn = init_db()
+    c = conn.cursor()
+    c.execute('DELETE FROM schedule')
+    c.execute('DELETE FROM manual_shifts')
+    conn.commit()
+    conn.close()
+    logging.info("Đã xóa toàn bộ dữ liệu lịch và ca thủ công")
+    st.success("Đã xóa toàn bộ dữ liệu lịch làm việc!")
+    st.rerun()
+
+# Hàm lưu giới hạn VX hoặc MAX_GENERATIONS vào DB
+def save_settings_to_db(key, value):
     conn = init_db()
     c = conn.cursor()
     c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
-              ('vx_min', str(vx_min)))
+              (key, str(value)))
     conn.commit()
     conn.close()
 
-# Hàm tải giới hạn VX tối thiểu từ DB
-def load_vx_min_from_db():
+# Hàm tải giới hạn VX hoặc MAX_GENERATIONS từ DB
+def load_setting_from_db(key, default):
     conn = init_db()
     c = conn.cursor()
-    c.execute('SELECT value FROM settings WHERE key = ?', ('vx_min',))
+    c.execute('SELECT value FROM settings WHERE key = ?', (key,))
     result = c.fetchone()
     conn.close()
-    return int(result[0]) if result else 3
+    return int(result[0]) if result else default
 
 # Hàm tạo danh sách các ca hợp lệ
 def get_valid_shifts():
@@ -156,7 +169,7 @@ def get_valid_shifts():
 # Hàm lấy giờ bắt đầu từ mã ca
 @lru_cache(maxsize=10000)
 def get_shift_start_hour(shift):
-    if shift in ["PRD", "AL", "NPL"]:
+    if shift in ["PRD", "AL", "NPL", ""]:
         return None
     code = int(shift[2:4])
     start_hour = code / 2
@@ -165,7 +178,7 @@ def get_shift_start_hour(shift):
 # Hàm lấy giờ kết thúc từ mã ca
 @lru_cache(maxsize=10000)
 def get_shift_end_hour(shift):
-    if shift in ["PRD", "AL", "NPL"]:
+    if shift in ["PRD", "AL", "NPL", ""]:
         return None
     start_hour = get_shift_start_hour(shift)
     if shift.startswith("VX"):
@@ -179,8 +192,8 @@ def get_shift_end_hour(shift):
 # Hàm kiểm tra tính khả thi của lịch
 def check_feasibility(employees, month_days, selected_shifts):
     cs_employees = [emp for emp in employees if emp["Bộ phận"] == "Customer Service"]
-    if len(cs_employees) < 3 and st.session_state.department_filter in ["Customer Service", "Tất cả"]:
-        return False, "Cần ít nhất 3 nhân viên Customer Service để phân bổ ca bắt buộc"
+    if len(cs_employees) < 4 and st.session_state.department_filter in ["Customer Service", "Tất cả"]:
+        return False, "Cần ít nhất 4 nhân viên Customer Service để phân bổ ca bắt buộc"
     
     required_shifts = ["V814", "V614", "V818", "V618", "V829", "V633"]
     missing_shifts = [s for s in required_shifts if s not in selected_shifts]
@@ -197,152 +210,355 @@ def check_feasibility(employees, month_days, selected_shifts):
     
     return True, ""
 
-# Hàm kiểm tra tính hợp lệ của lịch
-def is_valid_schedule(employee_schedule, employee, day, shift, month_days, sundays, vx_min):
-    errors = []
+# Hàm phân bổ ca cố định cho Customer Service
+def assign_fixed_cs_shifts(employees, month_days, manual_shifts):
+    cs_employees = [emp for emp in employees if emp["Bộ phận"] == "Customer Service"]
+    if len(cs_employees) < 4:
+        return False, "Cần ít nhất 4 nhân viên Customer Service để phân bổ ca cố định"
     
-    # Kiểm tra không quá 7 ngày làm việc liên tục
-    consecutive_days = 0
-    for d in range(day - 1, max(-1, day - 8), -1):
-        if d < 0 or employee_schedule.get(employee, [None] * len(month_days))[d] not in ["PRD", "AL", "NPL", None]:
-            consecutive_days += 1
-        else:
-            break
-    if consecutive_days >= 7 and shift not in ["PRD", "AL", "NPL"]:
-        errors.append("Vượt quá 7 ngày làm việc liên tục")
+    required_shifts = ["V814", "V818", "V829", "V633"]  # Ưu tiên V814, V818, V829
+    alternate_shifts = {"V814": "V614", "V818": "V618", "V829": "V633"}
+    shift_counts = {emp["ID"]: {"14": 0, "18": 0, "29/33": 0} for emp in cs_employees}
+    new_manual_shifts = manual_shifts.copy()
+    assigned_shifts = 0
     
-    # Kiểm tra không PRD, VX, V6 liên tiếp
-    if day > 0:
-        prev_shift = employee_schedule.get(employee, [''] * len(month_days))[day - 1]
-        if prev_shift and shift in ["PRD", "AL", "NPL"] and prev_shift in ["PRD", "AL", "NPL"]:
-            errors.append("PRD/AL/NPL liên tiếp với ngày trước")
-        if prev_shift and shift.startswith("VX") and prev_shift.startswith("VX"):
-            errors.append("Ca VX liên tiếp với ngày trước")
-        if prev_shift and shift.startswith("V6") and prev_shift.startswith("V6"):
-            errors.append("Ca V6 liên tiếp với ngày trước")
-    
-    # Kiểm tra giãn cách 12 giờ
-    if day > 0 and shift not in ["PRD", "AL", "NPL"]:
-        prev_shift = employee_schedule.get(employee, [''] * len(month_days))[day - 1]
-        if prev_shift and prev_shift not in ["PRD", "AL", "NPL"]:
-            current_start = get_shift_start_hour(shift)
-            prev_end = get_shift_end_hour(prev_shift)
-            if current_start is not None and prev_end is not None:
-                prev_end_hour = prev_end % 24
-                prev_end_day_offset = 1 if prev_end >= 24 else 0
-                prev_end_minutes = int((prev_end % 1) * 60)
-                current_start_hour = int(current_start)
-                current_start_minutes = int((current_start % 1) * 60)
-                current_time = month_days[day].replace(hour=current_start_hour, minute=current_start_minutes)
-                prev_time = month_days[day - 1 + prev_end_day_offset].replace(hour=int(prev_end_hour), minute=prev_end_minutes)
-                time_diff = (current_time - prev_time).total_seconds() / 3600
-                if time_diff < 12:
-                    errors.append(f"Giãn cách dưới 12 giờ (giờ ra ca trước: {int(prev_end_hour):02d}:{prev_end_minutes:02d}, giờ bắt đầu: {current_start_hour:02d}:{current_start_minutes:02d})")
-    
-    # Kiểm tra số ca VX = V6 và không dưới vx_min
-    vx_count = sum(1 for s in employee_schedule.get(employee, []) if isinstance(s, str) and s.startswith("VX"))
-    v6_count = sum(1 for s in employee_schedule.get(employee, []) if isinstance(s, str) and s.startswith("V6"))
-    if shift.startswith("VX"):
-        vx_count += 1
-    elif shift.startswith("V6"):
-        v6_count += 1
-    if day == len(month_days) - 1 and vx_count != v6_count:
-        errors.append("Số ca VX và V6 không bằng nhau")
-    if day == len(month_days) - 1 and vx_count < vx_min:
-        errors.append(f"Số ca VX ({vx_count}) nhỏ hơn giới hạn tối thiểu ({vx_min})")
-    
-    # Kiểm tra PRD không rơi vào thứ 7, chủ nhật hoặc ngày lễ trừ khi nhập tay
-    date = month_days[day]
-    if (date.weekday() in [5, 6] or is_holiday(date)) and shift == "PRD" and (employee, day) not in st.session_state.manual_shifts:
-        errors.append("PRD vào thứ 7/chủ nhật/ngày lễ không được phân tự động")
-    
-    # Kiểm tra AL, NPL chỉ được nhập tay
-    if shift in ["AL", "NPL"] and (employee, day) not in st.session_state.manual_shifts:
-        errors.append(f"Ca {shift} chỉ được nhập tay")
-    
-    # Kiểm tra số ngày PRD bằng số ngày Chủ nhật
-    if day == len(month_days) - 1:
-        prd_count = sum(1 for s in employee_schedule.get(employee, []) if s == "PRD")
-        if prd_count != len(sundays):
-            errors.append(f"Số ngày PRD ({prd_count}) không bằng số ngày Chủ nhật ({len(sundays)})")
-    
-    # Kiểm tra ca có trong danh sách ca đã chọn (trừ ca thủ công)
-    if (employee, day) not in st.session_state.manual_shifts and shift not in ["PRD", "AL", "NPL"]:
-        if shift not in st.session_state.selected_shifts:
-            errors.append(f"Ca {shift} không nằm trong danh sách ca đã chọn")
-    
-    # Kiểm tra số lượng ca bắt buộc cho Customer Service
-    emp_dept = next((emp["Bộ phận"] for emp in st.session_state.employees if emp["ID"] == employee), None)
-    if emp_dept == "Customer Service":
-        temp_schedule = employee_schedule.copy()
-        if employee not in temp_schedule:
-            temp_schedule[employee] = [''] * len(month_days)
-        temp_schedule[employee][day] = shift
-        cs_shifts = [temp_schedule.get(emp["ID"], [''] * len(month_days))[day] 
-                     for emp in st.session_state.employees if emp["Bộ phận"] == "Customer Service"]
+    for day in range(len(month_days)):
+        available_employees = [emp["ID"] for emp in cs_employees if (emp["ID"], day) not in new_manual_shifts]
+        if len(available_employees) < 4:
+            continue  # Bỏ qua nếu không đủ nhân viên
+            
+        random.shuffle(available_employees)
         
+        # Gán V814 hoặc V614
+        emp_id = available_employees.pop(0)
+        shift = "V814" if "V814" in st.session_state.selected_shifts else "V614"
+        new_manual_shifts[(emp_id, day)] = shift
+        shift_counts[emp_id]["14"] += 1
+        assigned_shifts += 1
+        
+        # Gán V818 hoặc V618
+        emp_id = available_employees.pop(0)
+        shift = "V818" if "V818" in st.session_state.selected_shifts else "V618"
+        new_manual_shifts[(emp_id, day)] = shift
+        shift_counts[emp_id]["18"] += 1
+        assigned_shifts += 1
+        
+        # Gán 2 ca V829 hoặc V633 (tối đa 1 V633)
+        v633_assigned = False
+        for _ in range(2):
+            if not available_employees:
+                break
+            emp_id = available_employees.pop(0)
+            if "V633" in st.session_state.selected_shifts and not v633_assigned:
+                shift = "V633"
+                v633_assigned = True
+            else:
+                shift = "V829" if "V829" in st.session_state.selected_shifts else "V633"
+            new_manual_shifts[(emp_id, day)] = shift
+            shift_counts[emp_id]["29/33"] += 1
+            assigned_shifts += 1
+    
+    # Cân bằng số ca
+    total_days = len(month_days)
+    target_shifts = total_days // len(cs_employees)
+    for slot in ["14", "18", "29/33"]:
+        for _ in range(total_days * 10):  # Lặp nhiều lần để cân bằng
+            max_emp = max(shift_counts, key=lambda x: shift_counts[x][slot])
+            min_emp = min(shift_counts, key=lambda x: shift_counts[x][slot])
+            if shift_counts[max_emp][slot] <= shift_counts[min_emp][slot] + 1:
+                break
+            # Tìm ngày để hoán đổi
+            for day in range(len(month_days)):
+                if (max_emp, day) in new_manual_shifts and new_manual_shifts[(max_emp, day)] in [f"V8{slot}", f"V6{slot}"]:
+                    if (min_emp, day) not in new_manual_shifts:
+                        new_manual_shifts[(min_emp, day)] = new_manual_shifts[(max_emp, day)]
+                        del new_manual_shifts[(max_emp, day)]
+                        shift_counts[max_emp][slot] -= 1
+                        shift_counts[min_emp][slot] += 1
+                        break
+    
+    return new_manual_shifts, f"Đã phân bổ {assigned_shifts} ca cố định cho Customer Service"
+
+# Hàm tính điểm vi phạm (fitness) của lịch
+def calculate_fitness(schedule, employees, month_days, sundays, vx_min, balance_morning_evening, max_morning_evening_diff):
+    HARD_CONSTRAINT_WEIGHT = 1_000_000
+    SOFT_CONSTRAINT_WEIGHT = 1_000
+    violations = 0
+    violation_details = []
+    
+    for emp in employees:
+        emp_id = emp["ID"]
+        emp_schedule = schedule.get(emp_id, [''] * len(month_days))
+        emp_dept = emp["Bộ phận"]
+        
+        # Ràng buộc cứng
+        # 1. Không quá 7 ngày làm liên tục
+        consecutive_days = 0
+        for day in range(len(month_days)):
+            shift = emp_schedule[day]
+            if shift not in ["PRD", "AL", "NPL", ""]:
+                consecutive_days += 1
+                if consecutive_days > 7:
+                    violations += HARD_CONSTRAINT_WEIGHT
+                    violation_details.append(f"{emp_id}: Vượt quá 7 ngày làm liên tục tại ngày {month_days[day].strftime('%d/%m')}")
+            else:
+                consecutive_days = 0
+        
+        # 2. Không PRD/VX/V6 liên tiếp
+        for day in range(1, len(month_days)):
+            current_shift = emp_schedule[day]
+            prev_shift = emp_schedule[day-1]
+            if prev_shift and current_shift in ["PRD", "AL", "NPL"] and prev_shift in ["PRD", "AL", "NPL"]:
+                violations += HARD_CONSTRAINT_WEIGHT
+                violation_details.append(f"{emp_id}: PRD/AL/NPL liên tiếp ngày {month_days[day].strftime('%d/%m')}")
+            if prev_shift and current_shift.startswith("VX") and prev_shift.startswith("VX"):
+                violations += HARD_CONSTRAINT_WEIGHT
+                violation_details.append(f"{emp_id}: Ca VX liên tiếp ngày {month_days[day].strftime('%d/%m')}")
+            if prev_shift and current_shift.startswith("V6") and prev_shift.startswith("V6"):
+                violations += HARD_CONSTRAINT_WEIGHT
+                violation_details.append(f"{emp_id}: Ca V6 liên tiếp ngày {month_days[day].strftime('%d/%m')}")
+        
+        # 3. Giãn cách 12 giờ
+        for day in range(1, len(month_days)):
+            current_shift = emp_schedule[day]
+            prev_shift = emp_schedule[day-1]
+            if current_shift not in ["PRD", "AL", "NPL", ""] and prev_shift not in ["PRD", "AL", "NPL", ""]:
+                current_start = get_shift_start_hour(current_shift)
+                prev_end = get_shift_end_hour(prev_shift)
+                if current_start is not None and prev_end is not None:
+                    prev_end_hour = prev_end % 24
+                    prev_end_day_offset = 1 if prev_end >= 24 else 0
+                    prev_end_minutes = int((prev_end % 1) * 60)
+                    current_start_hour = int(current_start)
+                    current_start_minutes = int((current_start % 1) * 60)
+                    current_time = month_days[day].replace(hour=current_start_hour, minute=current_start_minutes)
+                    prev_time = month_days[day-1 + prev_end_day_offset].replace(hour=int(prev_end_hour), minute=prev_end_minutes)
+                    time_diff = (current_time - prev_time).total_seconds() / 3600
+                    if time_diff < 12:
+                        violations += HARD_CONSTRAINT_WEIGHT
+                        violation_details.append(f"{emp_id}: Giãn cách dưới 12 giờ ngày {month_days[day].strftime('%d/%m')}")
+        
+        # 4. Số ca VX = V6 và tối thiểu vx_min
+        vx_count = sum(1 for s in emp_schedule if s.startswith("VX"))
+        v6_count = sum(1 for s in emp_schedule if s.startswith("V6"))
+        if vx_count != v6_count:
+            violations += HARD_CONSTRAINT_WEIGHT * abs(vx_count - v6_count)
+            violation_details.append(f"{emp_id}: Số ca VX ({vx_count}) không bằng V6 ({v6_count})")
+        if vx_count < vx_min:
+            violations += HARD_CONSTRAINT_WEIGHT * (vx_min - vx_count)
+            violation_details.append(f"{emp_id}: Số ca VX ({vx_count}) nhỏ hơn tối thiểu ({vx_min})")
+        
+        # 5. PRD không vào thứ 7, chủ nhật, ngày lễ trừ khi nhập tay
+        for day in range(len(month_days)):
+            shift = emp_schedule[day]
+            date = month_days[day]
+            if (date.weekday() in [5, 6] or is_holiday(date)) and shift == "PRD" and (emp_id, day) not in st.session_state.manual_shifts:
+                violations += HARD_CONSTRAINT_WEIGHT
+                violation_details.append(f"{emp_id}: PRD vào thứ 7/chủ nhật/ngày lễ ngày {month_days[day].strftime('%d/%m')}")
+        
+        # 6. AL, NPL chỉ được nhập tay
+        for day in range(len(month_days)):
+            shift = emp_schedule[day]
+            if shift in ["AL", "NPL"] and (emp_id, day) not in st.session_state.manual_shifts:
+                violations += HARD_CONSTRAINT_WEIGHT
+                violation_details.append(f"{emp_id}: Ca {shift} không nhập tay ngày {month_days[day].strftime('%d/%m')}")
+        
+        # 7. Số ngày PRD bằng số ngày Chủ nhật
+        prd_count = sum(1 for s in emp_schedule if s == "PRD")
+        if prd_count != len(sundays):
+            violations += HARD_CONSTRAINT_WEIGHT * abs(prd_count - len(sundays))
+            violation_details.append(f"{emp_id}: Số ngày PRD ({prd_count}) không bằng số Chủ nhật ({len(sundays)})")
+        
+        # 8. Ca có trong danh sách ca đã chọn (trừ ca thủ công)
+        for day in range(len(month_days)):
+            shift = emp_schedule[day]
+            if (emp_id, day) not in st.session_state.manual_shifts and shift not in ["PRD", "AL", "NPL", ""]:
+                if shift not in st.session_state.selected_shifts:
+                    violations += HARD_CONSTRAINT_WEIGHT
+                    violation_details.append(f"{emp_id}: Ca {shift} không trong danh sách ca đã chọn ngày {month_days[day].strftime('%d/%m')}")
+        
+        # Ràng buộc mềm
+        # 1. Giảm thiểu PRD ngoài Chủ nhật
+        non_sunday_prd = sum(1 for day, s in enumerate(emp_schedule) if s == "PRD" and day not in sundays)
+        violations += SOFT_CONSTRAINT_WEIGHT * non_sunday_prd
+        if non_sunday_prd > 0:
+            violation_details.append(f"{emp_id}: {non_sunday_prd} ca PRD ngoài Chủ nhật")
+        
+        # 2. Cân bằng ca sáng-tối
+        if balance_morning_evening:
+            morning_count = sum(1 for s in emp_schedule if s not in ["PRD", "AL", "NPL", ""] and get_shift_start_hour(s) < 12)
+            evening_count = sum(1 for s in emp_schedule if s not in ["PRD", "AL", "NPL", ""] and get_shift_start_hour(s) >= 12)
+            diff = abs(morning_count - evening_count)
+            if diff > max_morning_evening_diff:
+                violations += SOFT_CONSTRAINT_WEIGHT * (diff - max_morning_evening_diff)
+                violation_details.append(f"{emp_id}: Độ lệch ca sáng ({morning_count}) và tối ({evening_count}) vượt quá {max_morning_evening_diff}")
+    
+    # Ràng buộc cứng: Ca bắt buộc cho Customer Service
+    cs_employees = [emp for emp in employees if emp["Bộ phận"] == "Customer Service"]
+    for day in range(len(month_days)):
+        cs_shifts = [schedule.get(emp["ID"], [''] * len(month_days))[day] for emp in cs_employees]
         v814_v614_count = cs_shifts.count("V814") + cs_shifts.count("V614")
         v818_v618_count = cs_shifts.count("V818") + cs_shifts.count("V618")
         v829_v633_count = cs_shifts.count("V829") + cs_shifts.count("V633")
         v633_count = cs_shifts.count("V633")
         
-        if v814_v614_count > 1:
-            errors.append("V814 hoặc V614 có hơn 1 nhân viên trong ngày")
-        if v818_v618_count > 1:
-            errors.append("V818 hoặc V618 có hơn 1 nhân viên trong ngày")
-        if v829_v633_count > 2:
-            errors.append("V829 hoặc V633 có hơn 2 nhân viên trong ngày")
+        if v814_v614_count != 1:
+            violations += HARD_CONSTRAINT_WEIGHT * abs(v814_v614_count - 1)
+            violation_details.append(f"Ngày {month_days[day].strftime('%d/%m')}: V814/V614 có {v814_v614_count} ca (cần 1)")
+        if v818_v618_count != 1:
+            violations += HARD_CONSTRAINT_WEIGHT * abs(v818_v618_count - 1)
+            violation_details.append(f"Ngày {month_days[day].strftime('%d/%m')}: V818/V618 có {v818_v618_count} ca (cần 1)")
+        if v829_v633_count != 2:
+            violations += HARD_CONSTRAINT_WEIGHT * abs(v829_v633_count - 2)
+            violation_details.append(f"Ngày {month_days[day].strftime('%d/%m')}: V829/V633 có {v829_v633_count} ca (cần 2)")
         if v633_count > 1:
-            errors.append("V633 có hơn 1 ca trong ngày")
+            violations += HARD_CONSTRAINT_WEIGHT * (v633_count - 1)
+            violation_details.append(f"Ngày {month_days[day].strftime('%d/%m')}: V633 có {v633_count} ca (tối đa 1)")
     
-    return len(errors) == 0, errors
+    return violations, violation_details
 
-# Hàm điều chỉnh ca không hợp lệ
-def adjust_invalid_shifts(schedule, employees, month_days, sundays, vx_min, valid_shifts):
-    invalid_cells = {}
+# Hàm khởi tạo cá thể ngẫu nhiên
+def initialize_random_individual(employees, month_days, valid_shifts, manual_shifts):
+    schedule = {emp["ID"]: [''] * len(month_days) for emp in employees}
     for emp in employees:
         emp_id = emp["ID"]
+        shift_pool = valid_shifts
+        if emp["Cấp bậc"] in ["Senior", "Manager"]:
+            morning_shifts = [s for s in valid_shifts if s != "PRD" and get_shift_start_hour(s) < 12]
+            if morning_shifts:
+                shift_pool = morning_shifts + ["PRD"]
         for day in range(len(month_days)):
-            shift = schedule.get(emp_id, [''] * len(month_days))[day]
-            if shift:
-                is_valid, errors = is_valid_schedule(schedule, emp_id, day, shift, month_days, sundays, vx_min)
-                if not is_valid:
-                    invalid_cells[(emp_id, day)] = errors
+            if (emp_id, day) in manual_shifts:
+                schedule[emp_id][day] = manual_shifts[(emp_id, day)]
+            else:
+                schedule[emp_id][day] = random.choice(shift_pool + [''])
+    return schedule
+
+# Hàm khởi tạo cá thể heuristic (ưu tiên ca CS bắt buộc)
+def initialize_heuristic_individual(employees, month_days, valid_shifts, manual_shifts, sundays):
+    schedule = {emp["ID"]: [''] * len(month_days) for emp in employees}
+    cs_employees = [emp for emp in employees if emp["Bộ phận"] == "Customer Service"]
+    required_shifts = ["V814", "V614", "V818", "V618", "V829", "V633"]
     
-    # Thử điều chỉnh các ca không hợp lệ
-    for (emp_id, day), errors in invalid_cells.items():
-        logging.info(f"Điều chỉnh ca không hợp lệ cho {emp_id} ngày {day}: {errors}")
-        current_shift = schedule[emp_id][day]
+    for day in range(len(month_days)):
+        available_cs = [emp["ID"] for emp in cs_employees if (emp["ID"], day) not in manual_shifts]
+        random.shuffle(available_cs)
+        
+        # Gán V814 hoặc V614
+        if available_cs and ("V814" in valid_shifts or "V614" in valid_shifts):
+            emp_id = available_cs.pop(0)
+            shift = "V814" if "V814" in valid_shifts else "V614"
+            if (emp_id, day) not in manual_shifts:
+                schedule[emp_id][day] = shift
+        
+        # Gán V818 hoặc V618
+        if available_cs and ("V818" in valid_shifts or "V618" in valid_shifts):
+            emp_id = available_cs.pop(0)
+            shift = "V818" if "V818" in valid_shifts else "V618"
+            if (emp_id, day) not in manual_shifts:
+                schedule[emp_id][day] = shift
+        
+        # Gán V829 hoặc V633 (2 ca)
+        if available_cs and ("V829" in valid_shifts or "V633" in valid_shifts):
+            for _ in range(2):
+                if available_cs:
+                    emp_id = available_cs.pop(0)
+                    shift = "V633" if "V633" in valid_shifts and schedule[emp_id][day] != "V633" else "V829"
+                    if (emp_id, day) not in manual_shifts:
+                        schedule[emp_id][day] = shift
+    
+    # Điền ngẫu nhiên các ô còn lại
+    for emp in employees:
+        emp_id = emp["ID"]
+        shift_pool = valid_shifts
+        if emp["Cấp bậc"] in ["Senior", "Manager"]:
+            morning_shifts = [s for s in valid_shifts if s != "PRD" and get_shift_start_hour(s) < 12]
+            if morning_shifts:
+                shift_pool = morning_shifts + ["PRD"]
+        for day in range(len(month_days)):
+            if (emp_id, day) not in manual_shifts and not schedule[emp_id][day]:
+                schedule[emp_id][day] = random.choice(shift_pool + [''])
+            if day in sundays and (emp_id, day) not in manual_shifts:
+                schedule[emp_id][day] = "PRD"
+    
+    return schedule
+
+# Hàm crossover (trao đổi đoạn ngày)
+def crossover(parent1, parent2, employees, month_days):
+    child1 = {emp["ID"]: [''] * len(month_days) for emp in employees}
+    child2 = {emp["ID"]: [''] * len(month_days) for emp in employees}
+    crossover_point = random.randint(1, len(month_days) - 1)
+    
+    for emp_id in child1:
+        child1[emp_id][:crossover_point] = parent1[emp_id][:crossover_point]
+        child1[emp_id][crossover_point:] = parent2[emp_id][crossover_point:]
+        child2[emp_id][:crossover_point] = parent2[emp_id][:crossover_point]
+        child2[emp_id][crossover_point:] = parent1[emp_id][crossover_point:]
+        
+        # Đảm bảo giữ các ca thủ công
+        for day in range(len(month_days)):
+            if (emp_id, day) in st.session_state.manual_shifts:
+                child1[emp_id][day] = st.session_state.manual_shifts[(emp_id, day)]
+                child2[emp_id][day] = st.session_state.manual_shifts[(emp_id, day)]
+    
+    return child1, child2
+
+# Hàm mutation
+def mutation(schedule, employees, month_days, valid_shifts, mutation_rate=0.01):
+    for emp in employees:
+        emp_id = emp["ID"]
+        shift_pool = valid_shifts
+        if emp["Cấp bậc"] in ["Senior", "Manager"]:
+            morning_shifts = [s for s in valid_shifts if s != "PRD" and get_shift_start_hour(s) < 12]
+            if morning_shifts:
+                shift_pool = morning_shifts + ["PRD"]
+        for day in range(len(month_days)):
+            if (emp_id, day) not in st.session_state.manual_shifts and random.random() < mutation_rate:
+                schedule[emp_id][day] = random.choice(shift_pool + [''])
+    return schedule
+
+# Hàm local repair (Min-Conflicts)
+def local_repair(schedule, employees, month_days, sundays, vx_min, balance_morning_evening, max_morning_evening_diff, max_steps=100):
+    valid_shifts = st.session_state.selected_shifts + ["PRD"]
+    for _ in range(max_steps):
+        fitness, violation_details = calculate_fitness(schedule, employees, month_days, sundays, vx_min, balance_morning_evening, max_morning_evening_diff)
+        if fitness == 0:
+            break
+        
+        # Chọn ô vi phạm ngẫu nhiên
+        emp_id = random.choice([emp["ID"] for emp in employees])
+        day = random.randint(0, len(month_days) - 1)
         if (emp_id, day) in st.session_state.manual_shifts:
-            continue  # Bỏ qua ca thủ công
-        for new_shift in valid_shifts:
-            if new_shift == current_shift:
+            continue
+        
+        current_shift = schedule[emp_id][day]
+        best_shift = current_shift
+        best_fitness = fitness
+        
+        # Thử tất cả ca hợp lệ
+        emp = next(e for e in employees if e["ID"] == emp_id)
+        shift_pool = valid_shifts
+        if emp["Cấp bậc"] in ["Senior", "Manager"]:
+            morning_shifts = [s for s in valid_shifts if s != "PRD" and get_shift_start_hour(s) < 12]
+            if morning_shifts:
+                shift_pool = morning_shifts + ["PRD"]
+        
+        for shift in shift_pool + ['']:
+            if shift == current_shift:
                 continue
-            is_valid, new_errors = is_valid_schedule(schedule, emp_id, day, new_shift, month_days, sundays, vx_min)
-            if is_valid:
-                schedule[emp_id][day] = new_shift
-                logging.info(f"Đã thay {current_shift} bằng {new_shift} cho {emp_id} ngày {day}")
-                break
-        else:
-            logging.warning(f"Không tìm được ca thay thế hợp lệ cho {emp_id} ngày {day}")
+            schedule[emp_id][day] = shift
+            new_fitness, _ = calculate_fitness(schedule, employees, month_days, sundays, vx_min, balance_morning_evening, max_morning_evening_diff)
+            if new_fitness < best_fitness:
+                best_fitness = new_fitness
+                best_shift = shift
+        schedule[emp_id][day] = best_shift
     
-    # Kiểm tra lại lịch sau khi điều chỉnh
-    invalid_cells = {}
-    for emp in employees:
-        emp_id = emp["ID"]
-        for day in range(len(month_days)):
-            shift = schedule.get(emp_id, [''] * len(month_days))[day]
-            if shift:
-                is_valid, errors = is_valid_schedule(schedule, emp_id, day, shift, month_days, sundays, vx_min)
-                if not is_valid:
-                    invalid_cells[(emp_id, day)] = errors
-    
-    return schedule, invalid_cells
+    return schedule
 
-# Hàm tạo lịch tự động sử dụng CP-SAT Solver
-def auto_schedule(employees, month_days, sundays, vx_min, department_filter, balance_morning_evening, max_morning_evening_diff):
+# Hàm Memetic Algorithm
+def auto_schedule(employees, month_days, sundays, vx_min, department_filter, balance_morning_evening, max_morning_evening_diff, max_generations):
     start_time = time.time()
-    logging.info(f"Bắt đầu tạo lịch với CP-SAT: {len(employees)} nhân viên, {len(month_days)} ngày, bộ phận: {department_filter}")
+    logging.info(f"Bắt đầu tạo lịch với Memetic Algorithm: {len(employees)} nhân viên, {len(month_days)} ngày, bộ phận: {department_filter}, max_generations: {max_generations}")
     
     if not employees:
         logging.error("Không có nhân viên để tạo lịch")
@@ -356,785 +572,170 @@ def auto_schedule(employees, month_days, sundays, vx_min, department_filter, bal
         logging.error(f"Không có nhân viên thuộc bộ phận {department_filter}")
         return {}
     
-    # Kiểm tra tính khả thi
-    is_feasible, reason = check_feasibility(employees, month_days, st.session_state.selected_shifts)
-    if not is_feasible:
-        logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
-        st.error(f"Không thể tạo lịch: {reason}")
-        return {}
-    
-    # Khởi tạo CP-SAT model
-    model = cp_model.CpModel()
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 60.0  # Giới hạn thời gian 60 giây
-    valid_shifts = [s for s in st.session_state.selected_shifts if s not in ["AL", "NPL"]]  # Loại bỏ "" và chỉ giữ PRD
-    if not valid_shifts:
-        logging.error("Danh sách ca hợp lệ rỗng")
-        st.error("Danh sách ca hợp lệ rỗng. Vui lòng chọn ít nhất một mã ca!")
-        return {}
-    
-    shift_to_idx = {shift: idx for idx, shift in enumerate(valid_shifts)}
-    idx_to_shift = {idx: shift for shift, idx in shift_to_idx.items()}
-    cs_employees = [emp for emp in employees if emp["Bộ phận"] == "Customer Service"]
+    valid_shifts = st.session_state.selected_shifts + ["PRD"]
     manual_shifts = st.session_state.get("manual_shifts", {})
-    
-    logging.info(f"Số ca khả dụng: {len(valid_shifts)}, số nhân viên CS: {len(cs_employees)}")
     
     # Thanh tiến trình
     progress_bar = st.progress(0)
     progress_text = st.empty()
-    progress_text.text("Khởi tạo biến...")
     
-    # Định nghĩa biến: variables[emp_id][day] là chỉ số ca được gán
-    variables = {}
-    total_steps = len(employees) * len(month_days) + len(employees) * (len(month_days) - 1) * 2 + len(employees) + len(month_days) + 10
-    current_step = 0
+    # Tham số Memetic Algorithm
+    POPULATION_SIZE = 50
+    MUTATION_RATE = 0.01
+    ELITE_SIZE = 5
+    TOURNAMENT_SIZE = 5
+    HARD_CONSTRAINT_THRESHOLD = 0
+    SOFT_CONSTRAINT_THRESHOLD = 1000
     
-    for emp in employees:
-        emp_id = emp["ID"]
-        variables[emp_id] = {}
-        for day in range(len(month_days)):
-            if (emp_id, day) in manual_shifts:
-                shift = manual_shifts[(emp_id, day)]
-                if shift not in valid_shifts and shift not in ["AL", "NPL"]:
-                    logging.warning(f"Ca thủ công {shift} không hợp lệ cho {emp_id} ngày {day}")
-                    continue
-                variables[emp_id][day] = model.NewIntVar(shift_to_idx.get(shift, 0), shift_to_idx.get(shift, 0), f"{emp_id}_{day}")
-            else:
-                shift_pool = valid_shifts
-                if emp["Cấp bậc"] in ["Senior", "Manager"]:
-                    morning_shifts = [s for s in st.session_state.selected_shifts if get_shift_start_hour(s) < 12]
-                    if morning_shifts:
-                        shift_pool = morning_shifts + ["PRD"]
-                variables[emp_id][day] = model.NewIntVar(0, len(valid_shifts) - 1, f"{emp_id}_{day}")
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
+    # Khởi tạo population
+    population = []
+    for i in range(POPULATION_SIZE):
+        if i < POPULATION_SIZE // 2:
+            individual = initialize_random_individual(employees, month_days, valid_shifts, manual_shifts)
+        else:
+            individual = initialize_heuristic_individual(employees, month_days, valid_shifts, manual_shifts, sundays)
+        population.append(individual)
+        progress_bar.progress(min((i + 1) / POPULATION_SIZE, 0.2))
+        progress_text.text(f"Khởi tạo cá thể {i + 1}/{POPULATION_SIZE}...")
     
-    progress_text.text("Thêm ràng buộc giãn cách 12 giờ...")
+    best_schedule = None
+    best_fitness = float('inf')
+    generation = 0
     
-    # Ràng buộc giãn cách 12 giờ
-    for emp in employees:
-        emp_id = emp["ID"]
-        for day in range(1, len(month_days)):
-            current_var = variables[emp_id][day]
-            prev_var = variables[emp_id][day - 1]
-            for prev_idx in range(len(valid_shifts)):
-                if prev_idx not in idx_to_shift:
-                    logging.warning(f"Chỉ số {prev_idx} không tồn tại trong idx_to_shift")
-                    continue
-                prev_shift = idx_to_shift[prev_idx]
-                if prev_shift in ["PRD", "AL", "NPL"]:
-                    continue
-                prev_end = get_shift_end_hour(prev_shift)
-                if prev_end is None:
-                    continue
-                prev_end_hour = prev_end % 24
-                prev_end_day_offset = 1 if prev_end >= 24 else 0
-                prev_end_minutes = int((prev_end % 1) * 60)
-                for current_idx in range(len(valid_shifts)):
-                    if current_idx not in idx_to_shift:
-                        logging.warning(f"Chỉ số {current_idx} không tồn tại trong idx_to_shift")
-                        continue
-                    current_shift = idx_to_shift[current_idx]
-                    if current_shift in ["PRD", "AL", "NPL"]:
-                        continue
-                    current_start = get_shift_start_hour(current_shift)
-                    if current_start is None:
-                        continue
-                    current_start_hour = int(current_start)
-                    current_start_minutes = int((current_start % 1) * 60)
-                    current_time = month_days[day].replace(hour=current_start_hour, minute=current_start_minutes)
-                    prev_time = month_days[day - 1 + prev_end_day_offset].replace(hour=int(prev_end_hour), minute=prev_end_minutes)
-                    time_diff = (current_time - prev_time).total_seconds() / 3600
-                    if time_diff < 12:
-                        not_prev_var = model.NewBoolVar(f"not_prev_{emp_id}_{day-1}_{prev_idx}")
-                        model.Add(prev_var != prev_idx).OnlyEnforceIf(not_prev_var)
-                        model.Add(prev_var == prev_idx).OnlyEnforceIf(not_prev_var.Not())
-                        is_current = model.NewBoolVar(f"current_{emp_id}_{day}_{current_idx}")
-                        model.Add(current_var == current_idx).OnlyEnforceIf(is_current)
-                        model.Add(current_var != current_idx).OnlyEnforceIf(is_current.Not())
-                        model.AddBoolOr([not_prev_var]).OnlyEnforceIf(is_current)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Thêm ràng buộc không PRD/VX/V6 liên tiếp...")
-    
-    # Ràng buộc không PRD/VX/V6 liên tiếp
-    for emp in employees:
-        emp_id = emp["ID"]
-        for day in range(1, len(month_days)):
-            current_var = variables[emp_id][day]
-            prev_var = variables[emp_id][day - 1]
-            prd_idx = shift_to_idx.get("PRD")
-            vx_indices = [shift_to_idx[s] for s in valid_shifts if s.startswith("VX")]
-            v6_indices = [shift_to_idx[s] for s in valid_shifts if s.startswith("V6")]
-            if prd_idx is not None:
-                is_prd = model.NewBoolVar(f"is_prd_{emp_id}_{day}")
-                model.Add(current_var == prd_idx).OnlyEnforceIf(is_prd)
-                model.Add(current_var != prd_idx).OnlyEnforceIf(is_prd.Not())
-                prev_is_prd = model.NewBoolVar(f"prev_is_prd_{emp_id}_{day-1}")
-                model.Add(prev_var == prd_idx).OnlyEnforceIf(prev_is_prd)
-                model.Add(prev_var != prd_idx).OnlyEnforceIf(prev_is_prd.Not())
-                model.AddBoolOr([prev_is_prd.Not()]).OnlyEnforceIf(is_prd)
-            if vx_indices:
-                vx_bools = [
-                    model.NewBoolVar(f"vx_bool_{emp_id}_{day}_{idx}")
-                    for idx in vx_indices
-                ]
-                for i, idx in enumerate(vx_indices):
-                    model.Add(current_var == idx).OnlyEnforceIf(vx_bools[i])
-                    model.Add(current_var != idx).OnlyEnforceIf(vx_bools[i].Not())
-                is_vx = model.NewBoolVar(f"is_vx_{emp_id}_{day}")
-                model.AddBoolOr(vx_bools).OnlyEnforceIf(is_vx)
-                model.AddBoolOr([vb.Not() for vb in vx_bools]).OnlyEnforceIf(is_vx.Not())
-                prev_not_vx_bools = [
-                    model.NewBoolVar(f"prev_not_vx_{emp_id}_{day-1}_{i}")
-                    for i in range(len(valid_shifts)) if i in idx_to_shift and i not in vx_indices
-                ]
-                for i, idx in enumerate([i for i in range(len(valid_shifts)) if i in idx_to_shift and i not in vx_indices]):
-                    model.Add(prev_var == idx).OnlyEnforceIf(prev_not_vx_bools[i])
-                    model.Add(prev_var != idx).OnlyEnforceIf(prev_not_vx_bools[i].Not())
-                if prev_not_vx_bools:
-                    model.AddBoolOr(prev_not_vx_bools).OnlyEnforceIf(is_vx)
-            if v6_indices:
-                v6_bools = [
-                    model.NewBoolVar(f"v6_bool_{emp_id}_{day}_{idx}")
-                    for idx in v6_indices
-                ]
-                for i, idx in enumerate(v6_indices):
-                    model.Add(current_var == idx).OnlyEnforceIf(v6_bools[i])
-                    model.Add(current_var != idx).OnlyEnforceIf(v6_bools[i].Not())
-                is_v6 = model.NewBoolVar(f"is_v6_{emp_id}_{day}")
-                model.AddBoolOr(v6_bools).OnlyEnforceIf(is_v6)
-                model.AddBoolOr([vb.Not() for vb in v6_bools]).OnlyEnforceIf(is_v6.Not())
-                prev_not_v6_bools = [
-                    model.NewBoolVar(f"prev_not_v6_{emp_id}_{day-1}_{i}")
-                    for i in range(len(valid_shifts)) if i in idx_to_shift and i not in v6_indices
-                ]
-                for i, idx in enumerate([i for i in range(len(valid_shifts)) if i in idx_to_shift and i not in v6_indices]):
-                    model.Add(prev_var == idx).OnlyEnforceIf(prev_not_v6_bools[i])
-                    model.Add(prev_var != idx).OnlyEnforceIf(prev_not_v6_bools[i].Not())
-                if prev_not_v6_bools:
-                    model.AddBoolOr(prev_not_v6_bools).OnlyEnforceIf(is_v6)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Thêm ràng buộc không quá 7 ngày làm liên tục...")
-    
-    # Ràng buộc không quá 7 ngày làm liên tục
-    prd_idx = shift_to_idx.get("PRD")
-    for emp in employees:
-        emp_id = emp["ID"]
-        for day in range(7, len(month_days)):
-            vars_window = [variables[emp_id][d] for d in range(day - 7, day + 1)]
-            work_days = [model.NewBoolVar(f"work_{emp_id}_{d}") for d in range(day - 7, day + 1)]
-            for i, var in enumerate(vars_window):
-                if prd_idx is not None:
-                    model.Add(var != prd_idx).OnlyEnforceIf(work_days[i])
-                    model.Add(var == prd_idx).OnlyEnforceIf(work_days[i].Not())
-            model.Add(sum(work_days) <= 7)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Thêm ràng buộc không PRD vào thứ 7, chủ nhật, ngày lễ...")
-    
-    # Tạo danh sách các ngày không cho phép PRD
-    non_prd_days = [
-        day for day in range(len(month_days))
-        if (month_days[day].weekday() in [5, 6] or is_holiday(month_days[day]))
-    ]
-    non_prd_days_no_saturday = [
-        day for day in range(len(month_days))
-        if (month_days[day].weekday() == 6 or is_holiday(month_days[day]))
-    ]
-    if prd_idx is not None:
-        for emp in employees:
-            emp_id = emp["ID"]
-            for day in non_prd_days_no_saturday:
-                if (emp_id, day) not in manual_shifts:
-                    var = variables[emp_id][day]
-                    model.Add(var != prd_idx)
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Thêm ràng buộc số ngày PRD bằng số ngày Chủ nhật...")
-    
-    # Ràng buộc số ngày PRD bằng số ngày Chủ nhật
-    if prd_idx is not None:
-        for emp in employees:
-            emp_id = emp["ID"]
-            vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-            prd_count = sum(model.NewBoolVar(f"prd_{emp_id}_{day}") for day in range(len(month_days)))
-            for day in range(len(month_days)):
-                model.Add(variables[emp_id][day] == prd_idx).OnlyEnforceIf(model.NewBoolVar(f"prd_{emp_id}_{day}"))
-                model.Add(variables[emp_id][day] != prd_idx).OnlyEnforceIf(model.NewBoolVar(f"prd_{emp_id}_{day}").Not())
-            model.Add(prd_count == len(sundays))
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Thêm ràng buộc VX = V6 và tối thiểu VX...")
-    
-    # Ràng buộc VX = V6 và tối thiểu VX
-    for emp in employees:
-        emp_id = emp["ID"]
-        vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-        vx_indices = [shift_to_idx[s] for s in valid_shifts if s.startswith("VX")]
-        v6_indices = [shift_to_idx[s] for s in valid_shifts if s.startswith("V6")]
-        vx_count = sum(model.NewBoolVar(f"vx_{emp_id}_{day}") for day in range(len(month_days)))
-        v6_count = sum(model.NewBoolVar(f"v6_{emp_id}_{day}") for day in range(len(month_days)))
-        for day in range(len(month_days)):
-            if vx_indices:
-                vx_bools = [
-                    model.NewBoolVar(f"vx_bool_{emp_id}_{day}_{idx}")
-                    for idx in vx_indices
-                ]
-                for i, idx in enumerate(vx_indices):
-                    model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(vx_bools[i])
-                    model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(vx_bools[i].Not())
-                model.AddBoolOr(vx_bools).OnlyEnforceIf(model.NewBoolVar(f"vx_{emp_id}_{day}"))
-                model.AddBoolOr([vb.Not() for vb in vx_bools]).OnlyEnforceIf(model.NewBoolVar(f"vx_{emp_id}_{day}").Not())
-            if v6_indices:
-                v6_bools = [
-                    model.NewBoolVar(f"v6_bool_{emp_id}_{day}_{idx}")
-                    for idx in v6_indices
-                ]
-                for i, idx in enumerate(v6_indices):
-                    model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(v6_bools[i])
-                    model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(v6_bools[i].Not())
-                model.AddBoolOr(v6_bools).OnlyEnforceIf(model.NewBoolVar(f"v6_{emp_id}_{day}"))
-                model.AddBoolOr([vb.Not() for vb in v6_bools]).OnlyEnforceIf(model.NewBoolVar(f"v6_{emp_id}_{day}").Not())
-        model.Add(vx_count == v6_count)
-        model.Add(vx_count >= vx_min)
-        current_step += 1
-        progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Thêm ràng buộc ưu tiên V633 cho Customer Service...")
-    
-    # Ràng buộc ưu tiên V633 cho nhân viên Customer Service
-    v633_idx = shift_to_idx.get("V633")
-    if v633_idx is not None:
-        for emp in cs_employees:
-            emp_id = emp["ID"]
-            vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-            v633_count = sum(model.NewBoolVar(f"v633_{emp_id}_{day}") for day in range(len(month_days)))
-            for day in range(len(month_days)):
-                model.Add(variables[emp_id][day] == v633_idx).OnlyEnforceIf(model.NewBoolVar(f"v633_{emp_id}_{day}"))
-                model.Add(variables[emp_id][day] != v633_idx).OnlyEnforceIf(model.NewBoolVar(f"v633_{emp_id}_{day}").Not())
-            model.Add(v633_count >= 1)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Thêm ràng buộc ca bắt buộc Customer Service...")
-    
-    # Ràng buộc ca bắt buộc Customer Service
-    for day in range(len(month_days)):
-        cs_vars = [variables[emp["ID"]][day] for emp in cs_employees]
-        v814_v614_indices = [shift_to_idx.get(s) for s in ["V814", "V614"] if s in shift_to_idx]
-        v818_v618_indices = [shift_to_idx.get(s) for s in ["V818", "V618"] if s in shift_to_idx]
-        v829_v633_indices = [shift_to_idx.get(s) for s in ["V829", "V633"] if s in shift_to_idx]
-        v633_idx = shift_to_idx.get("V633")
+    while generation < max_generations:
+        # Đánh giá fitness
+        fitness_scores = []
+        for i, individual in enumerate(population):
+            fitness, details = calculate_fitness(individual, employees, month_days, sundays, vx_min, balance_morning_evening, max_morning_evening_diff)
+            fitness_scores.append((fitness, individual, details))
+            if fitness < best_fitness:
+                best_fitness = fitness
+                best_schedule = individual
+                logging.info(f"Thế hệ {generation}: Cập nhật lịch tốt nhất, fitness = {best_fitness}")
+            progress_bar.progress(min(0.2 + (i + 1) / POPULATION_SIZE * 0.2, 0.4))
+            progress_text.text(f"Đánh giá cá thể {i + 1}/{POPULATION_SIZE} trong thế hệ {generation + 1}...")
         
-        if v814_v614_indices:
-            v814_v614_bools = []
-            for emp in cs_employees:
-                for idx in v814_v614_indices:
-                    if idx is not None:
-                        is_shift = model.NewBoolVar(f"v814_v614_{emp['ID']}_{day}_{idx}")
-                        model.Add(variables[emp["ID"]][day] == idx).OnlyEnforceIf(is_shift)
-                        model.Add(variables[emp["ID"]][day] != idx).OnlyEnforceIf(is_shift.Not())
-                        v814_v614_bools.append(is_shift)
-            if v814_v614_bools:
-                model.Add(sum(v814_v614_bools) == 1)
-        if v818_v618_indices:
-            v818_v618_bools = []
-            for emp in cs_employees:
-                for idx in v818_v618_indices:
-                    if idx is not None:
-                        is_shift = model.NewBoolVar(f"v818_v618_{emp['ID']}_{day}_{idx}")
-                        model.Add(variables[emp["ID"]][day] == idx).OnlyEnforceIf(is_shift)
-                        model.Add(variables[emp["ID"]][day] != idx).OnlyEnforceIf(is_shift.Not())
-                        v818_v618_bools.append(is_shift)
-            if v818_v618_bools:
-                model.Add(sum(v818_v618_bools) == 1)
-        if v829_v633_indices:
-            v829_v633_bools = []
-            for emp in cs_employees:
-                for idx in v829_v633_indices:
-                    if idx is not None:
-                        is_shift = model.NewBoolVar(f"v829_v633_{emp['ID']}_{day}_{idx}")
-                        model.Add(variables[emp["ID"]][day] == idx).OnlyEnforceIf(is_shift)
-                        model.Add(variables[emp["ID"]][day] != idx).OnlyEnforceIf(is_shift.Not())
-                        v829_v633_bools.append(is_shift)
-            if v829_v633_bools:
-                model.Add(sum(v829_v633_bools) == 2)
-        if v633_idx is not None:
-            v633_bools = []
-            for emp in cs_employees:
-                is_shift = model.NewBoolVar(f"v633_{emp['ID']}_{day}")
-                model.Add(variables[emp["ID"]][day] == v633_idx).OnlyEnforceIf(is_shift)
-                model.Add(variables[emp["ID"]][day] != v633_idx).OnlyEnforceIf(is_shift.Not())
-                v633_bools.append(is_shift)
-            if v633_bools:
-                model.Add(sum(v633_bools) <= 1)
-        current_step += 1
-        progress_bar.progress(min(current_step / total_steps, 0.99))
+        # Kiểm tra điều kiện dừng
+        if best_fitness <= HARD_CONSTRAINT_THRESHOLD + SOFT_CONSTRAINT_THRESHOLD:
+            logging.info(f"Tìm thấy lịch khả thi tại thế hệ {generation}, fitness = {best_fitness}")
+            break
+        
+        # Lựa chọn elitism
+        fitness_scores.sort(key=lambda x: x[0])
+        new_population = [fs[1] for fs in fitness_scores[:ELITE_SIZE]]
+        
+        # Tournament selection
+        while len(new_population) < POPULATION_SIZE:
+            tournament = random.sample(fitness_scores, TOURNAMENT_SIZE)
+            winner = min(tournament, key=lambda x: x[0])[1]
+            new_population.append(winner)
+        
+        population = new_population[:POPULATION_SIZE]
+        
+        # Crossover
+        for i in range(ELITE_SIZE, POPULATION_SIZE, 2):
+            if i + 1 < POPULATION_SIZE:
+                parent1 = population[i]
+                parent2 = population[i + 1]
+                child1, child2 = crossover(parent1, parent2, employees, month_days)
+                population[i] = child1
+                population[i + 1] = child2
+            progress_bar.progress(min(0.4 + (i + 1) / POPULATION_SIZE * 0.2, 0.6))
+            progress_text.text(f"Thực hiện crossover {i + 1}/{POPULATION_SIZE} trong thế hệ {generation + 1}...")
+        
+        # Mutation
+        for i in range(ELITE_SIZE, POPULATION_SIZE):
+            population[i] = mutation(population[i], employees, month_days, valid_shifts, MUTATION_RATE)
+            progress_bar.progress(min(0.6 + (i + 1 - ELITE_SIZE) / (POPULATION_SIZE - ELITE_SIZE) * 0.2, 0.8))
+            progress_text.text(f"Thực hiện mutation {i + 1 - ELITE_SIZE}/{POPULATION_SIZE - ELITE_SIZE} trong thế hệ {generation + 1}...")
+        
+        # Local repair
+        for i in range(ELITE_SIZE, POPULATION_SIZE):
+            population[i] = local_repair(population[i], employees, month_days, sundays, vx_min, balance_morning_evening, max_morning_evening_diff)
+            progress_bar.progress(min(0.8 + (i + 1 - ELITE_SIZE) / (POPULATION_SIZE - ELITE_SIZE) * 0.1, 0.9))
+            progress_text.text(f"Thực hiện local repair {i + 1 - ELITE_SIZE}/{POPULATION_SIZE - ELITE_SIZE} trong thế hệ {generation + 1}...")
+        
+        generation += 1
+        progress_bar.progress(min(0.9 + generation / max_generations * 0.1, 0.99))
+        progress_text.text(f"Hoàn tất thế hệ {generation}/{max_generations}...")
     
-    progress_text.text("Thêm ràng buộc số ca PRD mỗi ngày...")
-    
-    # Tính toán số ca PRD tối đa mỗi ngày
-    total_prd = len(sundays) * len(employees)
-    manual_prd_count = sum(1 for (emp_id, day), shift in manual_shifts.items() if shift == "PRD")
-    non_prd_days_count = sum(1 for day in range(len(month_days)) if (month_days[day].weekday() == 6 or is_holiday(month_days[day])))
-    prd_possible_days = len(month_days) - non_prd_days_count
-    max_prd_per_day = math.ceil((total_prd - manual_prd_count) / max(prd_possible_days, 1)) if prd_possible_days > 0 else 0
-    logging.info(f"Tổng số PRD: {total_prd}, PRD nhập tay: {manual_prd_count}, Ngày có thể sắp PRD: {prd_possible_days}, Max PRD/ngày: {max_prd_per_day}")
-    
-    # Thêm ràng buộc số ca PRD mỗi ngày
-    if prd_idx is not None:
-        for day in range(len(month_days)):
-            if month_days[day].weekday() == 5:  # Thứ 7
-                continue
-            day_vars = [variables[emp["ID"]][day] for emp in employees]
-            prd_bools = []
-            for emp in employees:
-                is_prd = model.NewBoolVar(f"prd_day_{emp['ID']}_{day}")
-                model.Add(variables[emp["ID"]][day] == prd_idx).OnlyEnforceIf(is_prd)
-                model.Add(variables[emp["ID"]][day] != prd_idx).OnlyEnforceIf(is_prd.Not())
-                prd_bools.append(is_prd)
-            model.Add(sum(prd_bools) <= max_prd_per_day)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    # Tối ưu hóa: Cân bằng ca Sáng-Tối
-    if balance_morning_evening:
-        progress_text.text("Thêm ràng buộc cân bằng ca Sáng-Tối...")
-        for emp in employees:
-            emp_id = emp["ID"]
-            vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-            morning_indices = [shift_to_idx[s] for s in valid_shifts if s not in ["PRD", "AL", "NPL"] and get_shift_start_hour(s) < 12]
-            evening_indices = [shift_to_idx[s] for s in valid_shifts if s not in ["PRD", "AL", "NPL"] and get_shift_start_hour(s) >= 12]
-            morning_bools = []
-            evening_bools = []
-            for day in range(len(month_days)):
-                for idx in morning_indices:
-                    is_morning = model.NewBoolVar(f"morning_{emp_id}_{day}_{idx}")
-                    model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(is_morning)
-                    model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(is_morning.Not())
-                    morning_bools.append(is_morning)
-                for idx in evening_indices:
-                    is_evening = model.NewBoolVar(f"evening_{emp_id}_{day}_{idx}")
-                    model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(is_evening)
-                    model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(is_evening.Not())
-                    evening_bools.append(is_evening)
-            morning_count = sum(morning_bools)
-            evening_count = sum(evening_bools)
-            diff = model.NewIntVar(-len(month_days), len(month_days), f"diff_{emp_id}")
-            model.Add(diff == morning_count - evening_count)
-            model.AddAbsEquality(max_morning_evening_diff, diff)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-    
-    progress_text.text("Giải bài toán CP-SAT...")
-    
-    # Giải bài toán
-    status = solver.Solve(model)
+    # Lưu lịch tốt nhất
     elapsed_time = time.time() - start_time
-    logging.info(f"Kết thúc giải bài toán CP-SAT. Trạng thái: {solver.StatusName(status)}, thời gian: {elapsed_time:.2f} giây")
-    
-    progress_bar.progress(1.0)
-    progress_text.text(f"Hoàn tất! Trạng thái: {solver.StatusName(status)} trong {elapsed_time:.2f} giây")
-    
-    if status == cp_model.FEASIBLE or status == cp_model.OPTIMAL:
-        schedule = {emp["ID"]: ["PRD"] * len(month_days) for emp in employees}  # Khởi tạo mặc định bằng PRD
-        for emp in employees:
-            emp_id = emp["ID"]
-            for day in range(len(month_days)):
-                shift_idx = solver.Value(variables[emp_id][day])
-                if shift_idx in idx_to_shift:
-                    schedule[emp_id][day] = idx_to_shift[shift_idx]
-                else:
-                    logging.warning(f"Chỉ số ca {shift_idx} không hợp lệ cho {emp_id} ngày {day}")
-                    schedule[emp_id][day] = "PRD"  # Gán PRD nếu ca không hợp lệ
-        
-        current_schedule = st.session_state.get("schedule", {})
-        for emp_id in current_schedule:
-            if emp_id not in schedule:
-                schedule[emp_id] = current_schedule[emp_id]
-        
-        # Kiểm tra và điều chỉnh ca không hợp lệ
-        progress_text.text("Kiểm tra và điều chỉnh ca không hợp lệ...")
-        schedule, invalid_cells = adjust_invalid_shifts(schedule, employees, month_days, sundays, vx_min, valid_shifts)
-        if invalid_cells:
-            st.warning(f"Còn {len(invalid_cells)} ca không hợp lệ sau khi điều chỉnh. Vui lòng kiểm tra lịch.")
-            for (emp_id, day), errors in invalid_cells.items():
-                logging.warning(f"Ca không hợp lệ còn lại: {emp_id} ngày {month_days[day].strftime('%d/%m')} - {schedule[emp_id][day]}. Lý do: {'; '.join(errors)}")
-        
-        save_schedule_to_db(schedule, month_days)
-        logging.info("Lịch đã được lưu vào DB")
-        return schedule
-    else:
-        # Thử lại mà không áp dụng ràng buộc PRD cho thứ 7
-        logging.warning("Không tìm được lịch. Thử lại mà không hạn chế PRD vào thứ 7...")
-        st.warning("Không tìm được lịch với ràng buộc PRD. Thử lại mà không hạn chế PRD vào thứ 7...")
-        progress_bar.progress(0)
-        progress_text.text("Thử lại mà không hạn chế PRD vào thứ 7...")
-        current_step = 0
-        
-        model = cp_model.CpModel()
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 60.0
-        
-        variables = {}
-        for emp in employees:
-            emp_id = emp["ID"]
-            variables[emp_id] = {}
-            for day in range(len(month_days)):
-                if (emp_id, day) in manual_shifts:
-                    shift = manual_shifts[(emp_id, day)]
-                    if shift not in valid_shifts and shift not in ["AL", "NPL"]:
-                        logging.warning(f"Ca thủ công {shift} không hợp lệ cho {emp_id} ngày {day}")
-                        continue
-                    variables[emp_id][day] = model.NewIntVar(shift_to_idx.get(shift, 0), shift_to_idx.get(shift, 0), f"{emp_id}_{day}")
-                else:
-                    shift_pool = valid_shifts
-                    if emp["Cấp bậc"] in ["Senior", "Manager"]:
-                        morning_shifts = [s for s in st.session_state.selected_shifts if get_shift_start_hour(s) < 12]
-                        if morning_shifts:
-                            shift_pool = morning_shifts + ["PRD"]
-                    variables[emp_id][day] = model.NewIntVar(0, len(valid_shifts) - 1, f"{emp_id}_{day}")
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc giãn cách 12 giờ (thử lại)...")
-        for emp in employees:
-            emp_id = emp["ID"]
-            for day in range(1, len(month_days)):
-                current_var = variables[emp_id][day]
-                prev_var = variables[emp_id][day - 1]
-                for prev_idx in range(len(valid_shifts)):
-                    if prev_idx not in idx_to_shift:
-                        logging.warning(f"Chỉ số {prev_idx} không tồn tại trong idx_to_shift")
-                        continue
-                    prev_shift = idx_to_shift[prev_idx]
-                    if prev_shift in ["PRD", "AL", "NPL"]:
-                        continue
-                    prev_end = get_shift_end_hour(prev_shift)
-                    if prev_end is None:
-                        continue
-                    prev_end_hour = prev_end % 24
-                    prev_end_day_offset = 1 if prev_end >= 24 else 0
-                    prev_end_minutes = int((prev_end % 1) * 60)
-                    for current_idx in range(len(valid_shifts)):
-                        if current_idx not in idx_to_shift:
-                            logging.warning(f"Chỉ số {current_idx} không tồn tại trong idx_to_shift")
-                            continue
-                        current_shift = idx_to_shift[current_idx]
-                        if current_shift in ["PRD", "AL", "NPL"]:
-                            continue
-                        current_start = get_shift_start_hour(current_shift)
-                        if current_start is None:
-                            continue
-                        current_start_hour = int(current_start)
-                        current_start_minutes = int((current_start % 1) * 60)
-                        current_time = month_days[day].replace(hour=current_start_hour, minute=current_start_minutes)
-                        prev_time = month_days[day - 1 + prev_end_day_offset].replace(hour=int(prev_end_hour), minute=prev_end_minutes)
-                        time_diff = (current_time - prev_time).total_seconds() / 3600
-                        if time_diff < 12:
-                            not_prev_var = model.NewBoolVar(f"not_prev_{emp_id}_{day-1}_{prev_idx}")
-                            model.Add(prev_var != prev_idx).OnlyEnforceIf(not_prev_var)
-                            model.Add(prev_var == prev_idx).OnlyEnforceIf(not_prev_var.Not())
-                            is_current = model.NewBoolVar(f"current_{emp_id}_{day}_{current_idx}")
-                            model.Add(current_var == current_idx).OnlyEnforceIf(is_current)
-                            model.Add(current_var != current_idx).OnlyEnforceIf(is_current.Not())
-                            model.AddBoolOr([not_prev_var]).OnlyEnforceIf(is_current)
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc không PRD/VX/V6 liên tiếp (thử lại)...")
-        for emp in employees:
-            emp_id = emp["ID"]
-            for day in range(1, len(month_days)):
-                current_var = variables[emp_id][day]
-                prev_var = variables[emp_id][day - 1]
-                if prd_idx is not None:
-                    is_prd = model.NewBoolVar(f"is_prd_{emp_id}_{day}")
-                    model.Add(current_var == prd_idx).OnlyEnforceIf(is_prd)
-                    model.Add(current_var != prd_idx).OnlyEnforceIf(is_prd.Not())
-                    prev_is_prd = model.NewBoolVar(f"prev_is_prd_{emp_id}_{day-1}")
-                    model.Add(prev_var == prd_idx).OnlyEnforceIf(prev_is_prd)
-                    model.Add(prev_var != prd_idx).OnlyEnforceIf(prev_is_prd.Not())
-                    model.AddBoolOr([prev_is_prd.Not()]).OnlyEnforceIf(is_prd)
-                if vx_indices:
-                    vx_bools = [
-                        model.NewBoolVar(f"vx_bool_{emp_id}_{day}_{idx}")
-                        for idx in vx_indices
-                    ]
-                    for i, idx in enumerate(vx_indices):
-                        model.Add(current_var == idx).OnlyEnforceIf(vx_bools[i])
-                        model.Add(current_var != idx).OnlyEnforceIf(vx_bools[i].Not())
-                    is_vx = model.NewBoolVar(f"is_vx_{emp_id}_{day}")
-                    model.AddBoolOr(vx_bools).OnlyEnforceIf(is_vx)
-                    model.AddBoolOr([vb.Not() for vb in vx_bools]).OnlyEnforceIf(is_vx.Not())
-                    prev_not_vx_bools = [
-                        model.NewBoolVar(f"prev_not_vx_{emp_id}_{day-1}_{i}")
-                        for i in range(len(valid_shifts)) if i in idx_to_shift and i not in vx_indices
-                    ]
-                    for i, idx in enumerate([i for i in range(len(valid_shifts)) if i in idx_to_shift and i not in vx_indices]):
-                        model.Add(prev_var == idx).OnlyEnforceIf(prev_not_vx_bools[i])
-                        model.Add(prev_var != idx).OnlyEnforceIf(prev_not_vx_bools[i].Not())
-                    if prev_not_vx_bools:
-                        model.AddBoolOr(prev_not_vx_bools).OnlyEnforceIf(is_vx)
-                if v6_indices:
-                    v6_bools = [
-                        model.NewBoolVar(f"v6_bool_{emp_id}_{day}_{idx}")
-                        for idx in v6_indices
-                    ]
-                    for i, idx in enumerate(v6_indices):
-                        model.Add(current_var == idx).OnlyEnforceIf(v6_bools[i])
-                        model.Add(current_var != idx).OnlyEnforceIf(v6_bools[i].Not())
-                    is_v6 = model.NewBoolVar(f"is_v6_{emp_id}_{day}")
-                    model.AddBoolOr(v6_bools).OnlyEnforceIf(is_v6)
-                    model.AddBoolOr([vb.Not() for vb in v6_bools]).OnlyEnforceIf(is_v6.Not())
-                    prev_not_v6_bools = [
-                        model.NewBoolVar(f"prev_not_v6_{emp_id}_{day-1}_{i}")
-                        for i in range(len(valid_shifts)) if i in idx_to_shift and i not in v6_indices
-                    ]
-                    for i, idx in enumerate([i for i in range(len(valid_shifts)) if i in idx_to_shift and i not in v6_indices]):
-                        model.Add(prev_var == idx).OnlyEnforceIf(prev_not_v6_bools[i])
-                        model.Add(prev_var != idx).OnlyEnforceIf(prev_not_v6_bools[i].Not())
-                    if prev_not_v6_bools:
-                        model.AddBoolOr(prev_not_v6_bools).OnlyEnforceIf(is_v6)
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc không quá 7 ngày làm liên tục (thử lại)...")
-        for emp in employees:
-            emp_id = emp["ID"]
-            for day in range(7, len(month_days)):
-                vars_window = [variables[emp_id][d] for d in range(day - 7, day + 1)]
-                work_days = [model.NewBoolVar(f"work_{emp_id}_{d}") for d in range(day - 7, day + 1)]
-                for i, var in enumerate(vars_window):
-                    if prd_idx is not None:
-                        model.Add(var != prd_idx).OnlyEnforceIf(work_days[i])
-                        model.Add(var == prd_idx).OnlyEnforceIf(work_days[i].Not())
-                model.Add(sum(work_days) <= 7)
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc không PRD vào chủ nhật, ngày lễ (thử lại)...")
-        if prd_idx is not None:
-            for emp in employees:
-                emp_id = emp["ID"]
-                for day in [d for d in range(len(month_days)) if (month_days[d].weekday() == 6 or is_holiday(month_days[d]))]:
-                    if (emp_id, day) not in manual_shifts:
-                        var = variables[emp_id][day]
-                        model.Add(var != prd_idx)
-                    current_step += 1
-                    progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc số ngày PRD bằng số ngày Chủ nhật (thử lại)...")
-        if prd_idx is not None:
-            for emp in employees:
-                emp_id = emp["ID"]
-                vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-                prd_count = sum(model.NewBoolVar(f"prd_{emp_id}_{day}") for day in range(len(month_days)))
-                for day in range(len(month_days)):
-                    model.Add(variables[emp_id][day] == prd_idx).OnlyEnforceIf(model.NewBoolVar(f"prd_{emp_id}_{day}"))
-                    model.Add(variables[emp_id][day] != prd_idx).OnlyEnforceIf(model.NewBoolVar(f"prd_{emp_id}_{day}").Not())
-                model.Add(prd_count == len(sundays))
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc VX = V6 và tối thiểu VX (thử lại)...")
-        for emp in employees:
-            emp_id = emp["ID"]
-            vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-            vx_count = sum(model.NewBoolVar(f"vx_{emp_id}_{day}") for day in range(len(month_days)))
-            v6_count = sum(model.NewBoolVar(f"v6_{emp_id}_{day}") for day in range(len(month_days)))
-            for day in range(len(month_days)):
-                if vx_indices:
-                    vx_bools = [
-                        model.NewBoolVar(f"vx_bool_{emp_id}_{day}_{idx}")
-                        for idx in vx_indices
-                    ]
-                    for i, idx in enumerate(vx_indices):
-                        model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(vx_bools[i])
-                        model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(vx_bools[i].Not())
-                    model.AddBoolOr(vx_bools).OnlyEnforceIf(model.NewBoolVar(f"vx_{emp_id}_{day}"))
-                    model.AddBoolOr([vb.Not() for vb in vx_bools]).OnlyEnforceIf(model.NewBoolVar(f"vx_{emp_id}_{day}").Not())
-                if v6_indices:
-                    v6_bools = [
-                        model.NewBoolVar(f"v6_bool_{emp_id}_{day}_{idx}")
-                        for idx in v6_indices
-                    ]
-                    for i, idx in enumerate(v6_indices):
-                        model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(v6_bools[i])
-                        model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(v6_bools[i].Not())
-                    model.AddBoolOr(v6_bools).OnlyEnforceIf(model.NewBoolVar(f"v6_{emp_id}_{day}"))
-                    model.AddBoolOr([vb.Not() for vb in v6_bools]).OnlyEnforceIf(model.NewBoolVar(f"v6_{emp_id}_{day}").Not())
-            model.Add(vx_count == v6_count)
-            model.Add(vx_count >= vx_min)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc ưu tiên V633 cho Customer Service (thử lại)...")
-        if v633_idx is not None:
-            for emp in cs_employees:
-                emp_id = emp["ID"]
-                vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-                v633_count = sum(model.NewBoolVar(f"v633_{emp_id}_{day}") for day in range(len(month_days)))
-                for day in range(len(month_days)):
-                    model.Add(variables[emp_id][day] == v633_idx).OnlyEnforceIf(model.NewBoolVar(f"v633_{emp_id}_{day}"))
-                    model.Add(variables[emp_id][day] != v633_idx).OnlyEnforceIf(model.NewBoolVar(f"v633_{emp_id}_{day}").Not())
-                model.Add(v633_count >= 1)
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc ca bắt buộc Customer Service (thử lại)...")
-        for day in range(len(month_days)):
-            cs_vars = [variables[emp["ID"]][day] for emp in cs_employees]
-            if v814_v614_indices:
-                v814_v614_bools = []
-                for emp in cs_employees:
-                    for idx in v814_v614_indices:
-                        if idx is not None:
-                            is_shift = model.NewBoolVar(f"v814_v614_{emp['ID']}_{day}_{idx}")
-                            model.Add(variables[emp["ID"]][day] == idx).OnlyEnforceIf(is_shift)
-                            model.Add(variables[emp["ID"]][day] != idx).OnlyEnforceIf(is_shift.Not())
-                            v814_v614_bools.append(is_shift)
-                if v814_v614_bools:
-                    model.Add(sum(v814_v614_bools) == 1)
-            if v818_v618_indices:
-                v818_v618_bools = []
-                for emp in cs_employees:
-                    for idx in v818_v618_indices:
-                        if idx is not None:
-                            is_shift = model.NewBoolVar(f"v818_v618_{emp['ID']}_{day}_{idx}")
-                            model.Add(variables[emp["ID"]][day] == idx).OnlyEnforceIf(is_shift)
-                            model.Add(variables[emp["ID"]][day] != idx).OnlyEnforceIf(is_shift.Not())
-                            v818_v618_bools.append(is_shift)
-                if v818_v618_bools:
-                    model.Add(sum(v818_v618_bools) == 1)
-            if v829_v633_indices:
-                v829_v633_bools = []
-                for emp in cs_employees:
-                    for idx in v829_v633_indices:
-                        if idx is not None:
-                            is_shift = model.NewBoolVar(f"v829_v633_{emp['ID']}_{day}_{idx}")
-                            model.Add(variables[emp["ID"]][day] == idx).OnlyEnforceIf(is_shift)
-                            model.Add(variables[emp["ID"]][day] != idx).OnlyEnforceIf(is_shift.Not())
-                            v829_v633_bools.append(is_shift)
-                if v829_v633_bools:
-                    model.Add(sum(v829_v633_bools) == 2)
-            if v633_idx is not None:
-                v633_bools = []
-                for emp in cs_employees:
-                    is_shift = model.NewBoolVar(f"v633_{emp['ID']}_{day}")
-                    model.Add(variables[emp["ID"]][day] == v633_idx).OnlyEnforceIf(is_shift)
-                    model.Add(variables[emp["ID"]][day] != v633_idx).OnlyEnforceIf(is_shift.Not())
-                    v633_bools.append(is_shift)
-                if v633_bools:
-                    model.Add(sum(v633_bools) <= 1)
-            current_step += 1
-            progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Thêm ràng buộc số ca PRD mỗi ngày (thử lại)...")
-        if prd_idx is not None:
-            for day in range(len(month_days)):
-                if month_days[day].weekday() == 6 or is_holiday(month_days[day]):
-                    continue
-                day_vars = [variables[emp["ID"]][day] for emp in employees]
-                prd_bools = []
-                for emp in employees:
-                    is_prd = model.NewBoolVar(f"prd_day_{emp['ID']}_{day}")
-                    model.Add(variables[emp["ID"]][day] == prd_idx).OnlyEnforceIf(is_prd)
-                    model.Add(variables[emp["ID"]][day] != prd_idx).OnlyEnforceIf(is_prd.Not())
-                    prd_bools.append(is_prd)
-                model.Add(sum(prd_bools) <= max_prd_per_day)
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        if balance_morning_evening:
-            progress_text.text("Thêm ràng buộc cân bằng ca Sáng-Tối (thử lại)...")
-            for emp in employees:
-                emp_id = emp["ID"]
-                vars_emp = [variables[emp_id][day] for day in range(len(month_days))]
-                morning_bools = []
-                evening_bools = []
-                for day in range(len(month_days)):
-                    for idx in morning_indices:
-                        is_morning = model.NewBoolVar(f"morning_{emp_id}_{day}_{idx}")
-                        model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(is_morning)
-                        model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(is_morning.Not())
-                        morning_bools.append(is_morning)
-                    for idx in evening_indices:
-                        is_evening = model.NewBoolVar(f"evening_{emp_id}_{day}_{idx}")
-                        model.Add(variables[emp_id][day] == idx).OnlyEnforceIf(is_evening)
-                        model.Add(variables[emp_id][day] != idx).OnlyEnforceIf(is_evening.Not())
-                        evening_bools.append(is_evening)
-                morning_count = sum(morning_bools)
-                evening_count = sum(evening_bools)
-                diff = model.NewIntVar(-len(month_days), len(month_days), f"diff_{emp_id}")
-                model.Add(diff == morning_count - evening_count)
-                model.AddAbsEquality(max_morning_evening_diff, diff)
-                current_step += 1
-                progress_bar.progress(min(current_step / total_steps, 0.99))
-        
-        progress_text.text("Giải bài toán CP-SAT (thử lại)...")
-        status = solver.Solve(model)
-        elapsed_time = time.time() - start_time
-        logging.info(f"Kết thúc thử lại. Trạng thái: {solver.StatusName(status)}, thời gian: {elapsed_time:.2f} giây")
-        
+    if best_schedule and any(shifts for shifts in best_schedule.values()):
+        save_schedule_to_db(best_schedule, month_days)
+        fitness, details = calculate_fitness(best_schedule, employees, month_days, sundays, vx_min, balance_morning_evening, max_morning_evening_diff)
+        shift_count = sum(len([s for s in shifts if s]) for shifts in best_schedule.values())
+        logging.info(f"Kết thúc Memetic Algorithm. Fitness tốt nhất: {fitness}, tổng số ca: {shift_count}, thời gian: {elapsed_time:.2f} giây")
+        if details:
+            logging.info(f"Vi phạm còn lại: {'; '.join(details)}")
         progress_bar.progress(1.0)
-        progress_text.text(f"Hoàn tất thử lại! Trạng thái: {solver.StatusName(status)} trong {elapsed_time:.2f} giây")
-        
-        if status == cp_model.FEASIBLE or status == cp_model.OPTIMAL:
-            schedule = {emp["ID"]: ["PRD"] * len(month_days) for emp in employees}
-            for emp in employees:
-                emp_id = emp["ID"]
-                for day in range(len(month_days)):
-                    shift_idx = solver.Value(variables[emp_id][day])
-                    if shift_idx in idx_to_shift:
-                        schedule[emp_id][day] = idx_to_shift[shift_idx]
-                    else:
-                        logging.warning(f"Chỉ số ca {shift_idx} không hợp lệ cho {emp_id} ngày {day}")
-                        schedule[emp_id][day] = "PRD"
-            
-            current_schedule = st.session_state.get("schedule", {})
-            for emp_id in current_schedule:
-                if emp_id not in schedule:
-                    schedule[emp_id] = current_schedule[emp_id]
-            
-            # Kiểm tra và điều chỉnh ca không hợp lệ
-            progress_text.text("Kiểm tra và điều chỉnh ca không hợp lệ (thử lại)...")
-            schedule, invalid_cells = adjust_invalid_shifts(schedule, employees, month_days, sundays, vx_min, valid_shifts)
-            if invalid_cells:
-                st.warning(f"Còn {len(invalid_cells)} ca không hợp lệ sau khi điều chỉnh. Vui lòng kiểm tra lịch.")
-                for (emp_id, day), errors in invalid_cells.items():
-                    logging.warning(f"Ca không hợp lệ còn lại: {emp_id} ngày {month_days[day].strftime('%d/%m')} - {schedule[emp_id][day]}. Lý do: {'; '.join(errors)}")
-            
-            save_schedule_to_db(schedule, month_days)
-            logging.info("Lịch thử lại đã được lưu vào DB")
-            return schedule
-        
-        errors = []
-        if len(cs_employees) < 3:
-            errors.append("Cần ít nhất 3 nhân viên Customer Service.")
-        if not all(s in st.session_state.selected_shifts for s in ["V814", "V614", "V818", "V618", "V829", "V633"]):
-            missing = [s for s in ["V814", "V614", "V818", "V618", "V829", "V633"] if s not in st.session_state.selected_shifts]
-            errors.append(f"Thiếu ca bắt buộc: {', '.join(missing)}")
-        if not st.session_state.selected_shifts:
-            errors.append("Danh sách ca trống.")
-        if not any(s for s in st.session_state.selected_shifts if get_shift_start_hour(s) < 12):
-            errors.append("Thiếu ca Sáng (bắt đầu trước 12h).")
-        if not any(s for s in st.session_state.selected_shifts if get_shift_start_hour(s) >= 12):
-            errors.append("Thiếu ca Tối (bắt đầu từ 12h trở đi).")
-        sundays_count = len(sundays)
-        if len(cs_employees) * sundays_count > len([s for s in st.session_state.selected_shifts if s == "PRD"]):
-            errors.append(f"Không đủ ca PRD để phân bổ {sundays_count} ngày Chủ nhật cho {len(cs_employees)} nhân viên")
-        st.error(f"Không tìm được lịch thỏa mãn tất cả ràng buộc! Lý do có thể bao gồm: {'; '.join(errors)}")
-        logging.error(f"Không tìm được lịch. Lý do: {'; '.join(errors)}")
+        progress_text.text(f"Hoàn tất! Fitness tốt nhất: {fitness} trong {elapsed_time:.2f} giây")
+        return best_schedule
+    else:
+        logging.error(f"Không tìm được lịch hợp lệ sau {max_generations} thế hệ")
+        progress_bar.progress(1.0)
+        progress_text.text(f"Thất bại! Không tìm được lịch hợp lệ sau {max_generations} thế hệ")
         return {}
+
+# Hàm tính thống kê số ca mỗi tuần
+def calculate_weekly_stats(schedule, filtered_employees, month_days):
+    week_indices = []
+    current_week = []
+    
+    for i, date in enumerate(month_days):
+        if date.weekday() == 0:  # Thứ Hai
+            if current_week:
+                week_indices.append(current_week)
+            current_week = [i]
+        else:
+            current_week.append(i)
+        if i == len(month_days) - 1:  # Ngày cuối cùng
+            week_indices.append(current_week)
+    
+    weekly_stats = {
+        'work': [],
+        'morning': [],
+        'evening': [],
+        'off': []
+    }
+    daily_stats = {
+        'work': [0] * len(month_days),
+        'morning': [0] * len(month_days),
+        'evening': [0] * len(month_days),
+        'off': [0] * len(month_days)
+    }
+    
+    for day in range(len(month_days)):
+        for emp in filtered_employees:
+            shift = schedule.get(emp["ID"], [''] * len(month_days))[day]
+            if shift in ["PRD", "AL", "NPL"]:
+                daily_stats['off'][day] += 1
+            elif shift:
+                daily_stats['work'][day] += 1
+                start_hour = get_shift_start_hour(shift)
+                if start_hour is not None:
+                    if start_hour < 12:
+                        daily_stats['morning'][day] += 1
+                    else:
+                        daily_stats['evening'][day] += 1
+    
+    for week in week_indices:
+        week_work = sum(daily_stats['work'][day] for day in week)
+        week_morning = sum(daily_stats['morning'][day] for day in week)
+        week_evening = sum(daily_stats['evening'][day] for day in week)
+        week_off = sum(daily_stats['off'][day] for day in week)
+        weekly_stats['work'].append(week_work)
+        weekly_stats['morning'].append(week_morning)
+        weekly_stats['evening'].append(week_evening)
+        weekly_stats['off'].append(week_off)
+    
+    week_labels = []
+    for i, week in enumerate(week_indices):
+        start_date = month_days[week[0]].strftime("%d/%m")
+        end_date = month_days[week[-1]].strftime("%d/%m")
+        week_labels.append(f"Tuần {i+1} ({start_date}-{end_date})")
+    
+    return weekly_stats, daily_stats, week_labels, week_indices
 
 # Khởi tạo trạng thái phiên
 if "employees" not in st.session_state:
@@ -1144,7 +745,9 @@ if "schedule" not in st.session_state:
 if "manual_shifts" not in st.session_state:
     st.session_state.manual_shifts = {}
 if "vx_min" not in st.session_state:
-    st.session_state.vx_min = load_vx_min_from_db()
+    st.session_state.vx_min = load_setting_from_db('vx_min', 3)
+if "max_generations" not in st.session_state:
+    st.session_state.max_generations = load_setting_from_db('max_generations', 10)
 if "department_filter" not in st.session_state:
     st.session_state.department_filter = "Tất cả"
 if "selected_shifts" not in st.session_state:
@@ -1153,8 +756,8 @@ if "balance_morning_evening" not in st.session_state:
     st.session_state.balance_morning_evening = True
 if "max_morning_evening_diff" not in st.session_state:
     st.session_state.max_morning_evening_diff = 4
-if "show_manual_editor" not in st.session_state:
-    st.session_state.show_manual_editor = False
+if "show_manual_shifts" not in st.session_state:
+    st.session_state.show_manual_shifts = False
 
 # Giao diện chính
 st.title("Phần mềm quản lý ca làm việc cho Cashier")
@@ -1269,22 +872,26 @@ with tab1:
 with tab2:
     st.subheader("Sắp lịch làm việc")
     
-    # Nhập tháng, năm, số ca VX tối thiểu
-    year = st.number_input("Năm", min_value=2020, max_value=2030, value=2025)
-    month = st.number_input("Tháng", min_value=1, max_value=12, value=datetime.now().month)
-    st.session_state.vx_min = st.number_input("Số ca VX tối thiểu mỗi nhân viên trong tháng", min_value=1, value=st.session_state.vx_min, step=1)
-    save_vx_min_to_db(st.session_state.vx_min)
+    # Sắp xếp các trường điều chỉnh theo cột
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        year = st.number_input("Năm", min_value=2020, max_value=2030, value=2025, step=1)
+        month = st.number_input("Tháng", min_value=1, max_value=12, value=datetime.now().month, step=1)
+    with col2:
+        st.session_state.vx_min = st.number_input("Số ca VX tối thiểu", min_value=1, value=st.session_state.vx_min, step=1)
+        save_settings_to_db('vx_min', st.session_state.vx_min)
+        st.session_state.max_generations = st.number_input("Số thế hệ tối đa", min_value=1, max_value=100, value=st.session_state.max_generations, step=1)
+        save_settings_to_db('max_generations', st.session_state.max_generations)
+    with col3:
+        st.session_state.department_filter = st.selectbox("Bộ phận", ["Tất cả", "Cashier", "Customer Service"], 
+                                                        index=["Tất cả", "Cashier", "Customer Service"].index(st.session_state.department_filter))
+        st.session_state.balance_morning_evening = st.checkbox("Cân bằng ca Sáng-Tối", value=st.session_state.balance_morning_evening)
+        if st.session_state.balance_morning_evening:
+            st.session_state.max_morning_evening_diff = st.number_input("Độ lệch Sáng-Tối tối đa", min_value=0, max_value=10, 
+                                                                     value=st.session_state.max_morning_evening_diff, step=1)
     
-    # Tùy chọn cân bằng ca Sáng-Tối
-    st.session_state.balance_morning_evening = st.checkbox("Cân bằng ca Sáng và ca Tối", value=True)
-    if st.session_state.balance_morning_evening:
-        st.session_state.max_morning_evening_diff = st.number_input("Độ lệch tối đa ca Sáng và ca Tối", min_value=0, max_value=10, value=st.session_state.max_morning_evening_diff, step=1)
-    
-    # Chọn bộ phận và mã ca
-    st.session_state.department_filter = st.selectbox("Bộ phận", ["Tất cả", "Cashier", "Customer Service"], index=["Tất cả", "Cashier", "Customer Service"].index(st.session_state.department_filter))
     all_shifts = get_valid_shifts()
     default_shifts = get_default_shifts(st.session_state.department_filter)
-    
     st.session_state.selected_shifts = st.multiselect(
         "Chọn mã ca",
         options=all_shifts + ["PRD", "AL", "NPL"],
@@ -1292,43 +899,29 @@ with tab2:
         key="shift_selector"
     )
     
-    # Tính toán danh sách ngày trong tháng
     _, last_day = calendar.monthrange(year, month)
     start_date = datetime(year, month, 26)
     end_date = datetime(year, month + 1, 25) if month < 12 else datetime(year + 1, 1, 25)
     month_days = [start_date + timedelta(days=x) for x in range((end_date - start_date).days + 1)]
     sundays = [i for i in range(len(month_days)) if month_days[i].weekday() == 6]
     
-    # Tải manual_shifts từ DB nếu chưa có
     if not st.session_state.manual_shifts:
         st.session_state.manual_shifts = load_manual_shifts_from_db(month_days)
     
-    # Nút Xác nhận để hiển thị bảng chỉnh sửa ca
-    if st.button("Xác nhận"):
-        if not st.session_state.employees:
-            st.error("Vui lòng xác định nhân viên trước khi tạo lịch!")
-        elif st.session_state.department_filter != "Tất cả" and not any(emp["Bộ phận"] == st.session_state.department_filter for emp in st.session_state.employees):
-            st.error(f"Không có nhân viên thuộc bộ phận {st.session_state.department_filter}!")
-        elif not st.session_state.selected_shifts:
-            st.error("Vui lòng chọn ít nhất một mã ca!")
+    # Tự động hiển thị bảng nhập ca nếu có nhân viên và mã ca
+    if st.session_state.employees and st.session_state.selected_shifts:
+        is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
+        if is_feasible:
+            st.session_state.show_manual_shifts = True
         else:
-            is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
-            if not is_feasible:
-                st.error(f"Không thể tạo lịch: {reason}")
-                logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
-            else:
-                st.session_state.show_manual_editor = True
-                st.session_state.schedule = {emp["ID"]: [""] * len(month_days) for emp in st.session_state.employees}
-                for (emp_id, day), shift in st.session_state.manual_shifts.items():
-                    if emp_id in st.session_state.schedule and day < len(month_days):
-                        st.session_state.schedule[emp_id][day] = shift
+            st.error(f"Không thể hiển thị bảng nhập ca: {reason}")
+            logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
     
-    # Hiển thị bảng chỉnh sửa ca nếu đã nhấn Xác nhận
-    if st.session_state.get("show_manual_editor", False):
-        st.subheader("Chỉnh sửa ca thủ công")
+    if st.session_state.show_manual_shifts:
+        st.subheader("Nhập và chỉnh sửa lịch làm việc")
         valid_shifts = get_valid_shifts() + ["PRD", "AL", "NPL"]
         columns = [f"{d.strftime('%a %d/%m')}" for d in month_days]
-        schedule_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + columns}
+        manual_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + columns}
         
         filtered_employees = st.session_state.employees if st.session_state.department_filter == "Tất cả" else [
             emp for emp in st.session_state.employees if emp["Bộ phận"] == st.session_state.department_filter
@@ -1337,19 +930,63 @@ with tab2:
         invalid_cells = {}
         for emp in filtered_employees:
             emp_id = emp["ID"]
-            schedule_data["ID Nhân viên"].append(emp_id)
-            schedule_data["Họ Tên"].append(emp["Họ Tên"])
+            manual_data["ID Nhân viên"].append(emp_id)
+            manual_data["Họ Tên"].append(emp["Họ Tên"])
             for day, col in enumerate(columns):
-                current_shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
-                schedule_data[col].append(current_shift)
-                if current_shift and current_shift not in [""]:
-                    is_valid, errors = is_valid_schedule(st.session_state.schedule, emp_id, day, current_shift, month_days, sundays, st.session_state.vx_min)
-                    if not is_valid:
+                shift = st.session_state.manual_shifts.get((emp_id, day), "")
+                if not shift and emp_id in st.session_state.schedule:
+                    shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
+                manual_data[col].append(shift)
+                if shift and shift not in [""] and (emp_id, day) not in st.session_state.manual_shifts:
+                    temp_schedule = {emp_id: ['' if i != day else shift for i in range(len(month_days))]}
+                    is_valid, errors = calculate_fitness(temp_schedule, [emp], month_days, sundays, 
+                                                       st.session_state.vx_min, st.session_state.balance_morning_evening, 
+                                                       st.session_state.max_morning_evening_diff)
+                    if is_valid > 0:
                         invalid_cells[(emp_id, day)] = errors
         
-        df_schedule = pd.DataFrame(schedule_data)
+        # Tính thống kê số ca
+        weekly_stats, daily_stats, week_labels, week_indices = calculate_weekly_stats(
+            st.session_state.schedule or {emp["ID"]: [''] * len(month_days) for emp in filtered_employees}, 
+            filtered_employees, 
+            month_days
+        )
         
-        st.write("Nhập ca thủ công (ô đỏ là ca không hợp lệ):")
+        # Tạo các hàng thống kê
+        weekly_work_row = {col: "" for col in ["ID Nhân viên", "Họ Tên"] + columns}
+        weekly_morning_row = {col: "" for col in ["ID Nhân viên", "Họ Tên"] + columns}
+        weekly_evening_row = {col: "" for col in ["ID Nhân viên", "Họ Tên"] + columns}
+        weekly_off_row = {col: "" for col in ["ID Nhân viên", "Họ Tên"] + columns}
+        
+        weekly_work_row["ID Nhân viên"] = "Tổng ca làm/tuần"
+        weekly_morning_row["ID Nhân viên"] = "Tổng ca sáng/tuần"
+        weekly_evening_row["ID Nhân viên"] = "Tổng ca tối/tuần"
+        weekly_off_row["ID Nhân viên"] = "Tổng ca nghỉ/tuần"
+        
+        week_index = 0
+        day_index = 0
+        for i, week in enumerate(week_indices):
+            for _ in week:
+                if day_index < len(columns):
+                    if i == week_index:
+                        weekly_work_row[columns[day_index]] = str(weekly_stats['work'][i])
+                        weekly_morning_row[columns[day_index]] = str(weekly_stats['morning'][i])
+                        weekly_evening_row[columns[day_index]] = str(weekly_stats['evening'][i])
+                        weekly_off_row[columns[day_index]] = str(weekly_stats['off'][i])
+                day_index += 1
+            week_index += 1
+        
+        daily_work_row = {"ID Nhân viên": "Tổng ca làm/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['work'][i] for i in range(len(columns))}
+        daily_morning_row = {"ID Nhân viên": "Tổng ca sáng/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['morning'][i] for i in range(len(columns))}
+        daily_evening_row = {"ID Nhân viên": "Tổng ca tối/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['evening'][i] for i in range(len(columns))}
+        daily_off_row = {"ID Nhân viên": "Tổng ca nghỉ/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['off'][i] for i in range(len(columns))}
+        
+        # Tạo DataFrame
+        df_manual = pd.DataFrame(manual_data)
+        df_stats = pd.DataFrame([weekly_work_row, weekly_morning_row, weekly_evening_row, weekly_off_row, daily_work_row, daily_morning_row, daily_evening_row, daily_off_row])
+        df_manual = pd.concat([df_stats.iloc[:4], df_manual, df_stats.iloc[4:]], ignore_index=True)
+        
+        st.write("Nhập và chỉnh sửa lịch làm việc (ô đỏ là ca không hợp lệ):")
         column_config = {
             "ID Nhân viên": st.column_config.TextColumn(disabled=True),
             "Họ Tên": st.column_config.TextColumn(disabled=True),
@@ -1358,12 +995,16 @@ with tab2:
             column_config[col] = st.column_config.SelectboxColumn(
                 options=[""] + valid_shifts,
                 default="",
-                width="small"
+                width="small",
+                disabled=col in columns and (df_manual.index[-4:].to_list() + df_manual.index[:4].to_list())
             )
         
         def style_invalid_cells(df):
             def apply_style(row):
                 styles = [''] * len(row)
+                if row["ID Nhân viên"] in ["Tổng ca làm/ngày", "Tổng ca sáng/ngày", "Tổng ca tối/ngày", "Tổng ca nghỉ/ngày",
+                                          "Tổng ca làm/tuần", "Tổng ca sáng/tuần", "Tổng ca tối/tuần", "Tổng ca nghỉ/tuần"]:
+                    return ['background-color: #f0f0f0'] * len(row)
                 emp_id = row["ID Nhân viên"]
                 for day in range(len(columns)):
                     if (emp_id, day) in invalid_cells:
@@ -1371,103 +1012,104 @@ with tab2:
                 return styles
             return df.style.apply(apply_style, axis=1)
         
-        edited_df = st.data_editor(
-            df_schedule,
+        edited_manual_df = st.data_editor(
+            df_manual,
             column_config=column_config,
             hide_index=True,
             use_container_width=True,
-            key="manual_shift_editor"
+            key="manual_shifts_editor"
         )
         
-        # Cập nhật manual_shifts và schedule khi chỉnh sửa
         for i, emp in enumerate(filtered_employees):
             emp_id = emp["ID"]
             for day, col in enumerate(columns):
-                new_shift = edited_df.iloc[i][col] if col in edited_df.columns else ""
-                current_shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
+                new_shift = edited_manual_df.iloc[i + 4][col] if col in edited_manual_df.columns else ""  # +4 vì có 4 hàng tuần
+                current_shift = st.session_state.manual_shifts.get((emp_id, day), "")
+                if not current_shift and emp_id in st.session_state.schedule:
+                    current_shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
                 if new_shift != current_shift and new_shift in valid_shifts + [""]:
-                    is_valid, errors = is_valid_schedule(st.session_state.schedule, emp_id, day, new_shift, month_days, sundays, st.session_state.vx_min)
-                    if is_valid:
-                        if emp_id not in st.session_state.schedule:
-                            st.session_state.schedule[emp_id] = [''] * len(month_days)
-                        st.session_state.schedule[emp_id][day] = new_shift
-                        if new_shift:
-                            st.session_state.manual_shifts[(emp_id, day)] = new_shift
-                        elif (emp_id, day) in st.session_state.manual_shifts:
-                            del st.session_state.manual_shifts[(emp_id, day)]
-                        save_schedule_to_db(st.session_state.schedule, month_days)
-                        save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
-                        if (emp_id, day) in invalid_cells:
-                            del invalid_cells[(emp_id, day)]
-                    else:
-                        st.warning(f"Ca {new_shift} không hợp lệ cho {emp['Họ Tên']} vào ngày {col}. Lý do: {'; '.join(errors)}")
-                        logging.warning(f"Ca không hợp lệ: {new_shift} cho {emp['Họ Tên']} ngày {col}. Lý do: {'; '.join(errors)}")
-                        invalid_cells[(emp_id, day)] = errors
+                    if new_shift:
+                        st.session_state.manual_shifts[(emp_id, day)] = new_shift
+                    elif (emp_id, day) in st.session_state.manual_shifts:
+                        del st.session_state.manual_shifts[(emp_id, day)]
+                    if emp_id not in st.session_state.schedule:
+                        st.session_state.schedule[emp_id] = [''] * len(month_days)
+                    st.session_state.schedule[emp_id][day] = new_shift
+                    save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
+                    save_schedule_to_db(st.session_state.schedule, month_days)
         
-        st.subheader("Lịch làm việc (Ca thủ công)")
-        st.dataframe(style_invalid_cells(df_schedule), use_container_width=True)
+        # Nút xóa lịch cũ
+        if st.button("Xóa lịch cũ"):
+            clear_schedule_data(month_days)
         
-        # Nút Sắp lịch tự động
-        if st.button("Sắp lịch tự động"):
-            st.session_state.schedule = auto_schedule(
-                st.session_state.employees,
-                month_days,
-                sundays,
-                st.session_state.vx_min,
-                st.session_state.department_filter,
-                st.session_state.balance_morning_evening,
-                st.session_state.max_morning_evening_diff
-            )
-            if st.session_state.schedule:
-                st.success("Đã tạo lịch thành công!")
-                st.session_state.show_manual_editor = False  # Ẩn bảng chỉnh sửa sau khi tạo lịch
+        # Nút bổ sung ca cố định
+        if st.button("Bổ sung ca cố định"):
+            if not st.session_state.employees:
+                st.error("Vui lòng xác định nhân viên trước khi bổ sung ca cố định!")
+            elif st.session_state.department_filter not in ["Customer Service", "Tất cả"]:
+                st.error("Chỉ có thể bổ sung ca cố định cho bộ phận Customer Service hoặc Tất cả!")
             else:
-                st.error("Không thể tạo lịch tự động. Vui lòng kiểm tra lại các ca thủ công và ràng buộc.")
-
-    # Hiển thị lịch cuối cùng nếu đã tạo
-    if st.session_state.schedule and not st.session_state.get("show_manual_editor", False):
-        st.subheader("Lịch làm việc cuối cùng")
-        columns = [f"{d.strftime('%a %d/%m')}" for d in month_days]
-        schedule_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + columns}
+                is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
+                if not is_feasible:
+                    st.error(f"Không thể bổ sung ca cố định: {reason}")
+                    logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
+                else:
+                    new_manual_shifts, message = assign_fixed_cs_shifts(st.session_state.employees, month_days, st.session_state.manual_shifts)
+                    if new_manual_shifts:
+                        st.session_state.manual_shifts = new_manual_shifts
+                        save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
+                        st.success(message)
+                        logging.info(message)
+                        st.rerun()
+                    else:
+                        st.error("Không thể bổ sung ca cố định: " + message)
+                        logging.error("Không thể bổ sung ca cố định: " + message)
         
-        filtered_employees = st.session_state.employees if st.session_state.department_filter == "Tất cả" else [
-            emp for emp in st.session_state.employees if emp["Bộ phận"] == st.session_state.department_filter
-        ]
-        
-        invalid_cells = {}
-        for emp in filtered_employees:
-            emp_id = emp["ID"]
-            schedule_data["ID Nhân viên"].append(emp_id)
-            schedule_data["Họ Tên"].append(emp["Họ Tên"])
-            for day, col in enumerate(columns):
-                current_shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
-                schedule_data[col].append(current_shift)
-                if current_shift and current_shift not in [""]:
-                    is_valid, errors = is_valid_schedule(st.session_state.schedule, emp_id, day, current_shift, month_days, sundays, st.session_state.vx_min)
-                    if not is_valid:
-                        invalid_cells[(emp_id, day)] = errors
-        
-        df_schedule = pd.DataFrame(schedule_data)
-        
-        st.write("Lịch làm việc (ô đỏ là ca không hợp lệ):")
-        column_config = {
-            "ID Nhân viên": st.column_config.TextColumn(disabled=True),
-            "Họ Tên": st.column_config.TextColumn(disabled=True),
-        }
-        for col in columns:
-            column_config[col] = st.column_config.TextColumn(disabled=True)
-        
-        def style_invalid_cells(df):
-            def apply_style(row):
-                styles = [''] * len(row)
-                emp_id = row["ID Nhân viên"]
-                for day in range(len(columns)):
-                    if (emp_id, day) in invalid_cells:
-                        styles[day + 2] = 'background-color: #ffcccc'
-                return styles
-            return df.style.apply(apply_style, axis=1)
-        
-        st.dataframe(style_invalid_cells(df_schedule), use_container_width=True)
+        st.subheader("Lịch làm việc")
+        st.dataframe(style_invalid_cells(df_manual), use_container_width=True)
+    
+    if st.button("Sắp lịch tự động"):
+        if not st.session_state.employees:
+            st.error("Vui lòng xác định nhân viên trước khi tạo lịch!")
+        elif st.session_state.department_filter != "Tất cả" and not any(emp["Bộ phận"] == st.session_state.department_filter for emp in st.session_state.employees):
+            st.error(f"Không có nhân viên thuộc bộ phận {st.session_state.department_filter}!")
+        elif not st.session_state.selected_shifts:
+            st.error("Vui lòng chọn ít nhất một mã ca!")
+        elif not st.session_state.show_manual_shifts:
+            st.error("Vui lòng nhập ca đăng ký hoặc bổ sung ca cố định trước khi tạo lịch!")
+        else:
+            is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
+            if not is_feasible:
+                st.error(f"Không thể tạo lịch: {reason}")
+                logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
+            else:
+                schedule = auto_schedule(
+                    st.session_state.employees,
+                    month_days,
+                    sundays,
+                    st.session_state.vx_min,
+                    st.session_state.department_filter,
+                    st.session_state.balance_morning_evening,
+                    st.session_state.max_morning_evening_diff,
+                    st.session_state.max_generations
+                )
+                if schedule and any(shifts for shifts in schedule.values()):
+                    st.session_state.schedule = schedule
+                    # Cập nhật manual_shifts với các ca từ lịch tự động (trừ các ca đã nhập tay trước đó)
+                    shift_count = 0
+                    for emp_id, shifts in schedule.items():
+                        for day, shift in enumerate(shifts):
+                            if shift and (emp_id, day) not in st.session_state.manual_shifts:
+                                st.session_state.manual_shifts[(emp_id, day)] = shift
+                                shift_count += 1
+                    save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
+                    save_schedule_to_db(st.session_state.schedule, month_days)
+                    logging.info(f"Đã lưu {shift_count} ca vào manual_shifts và schedule")
+                    st.success(f"Đã tạo lịch thành công với {shift_count} ca được phân bổ!")
+                    st.rerun()  # Làm mới giao diện để hiển thị lịch
+                else:
+                    st.error(f"Không thể tạo lịch hợp lệ sau {st.session_state.max_generations} thế hệ. Vui lòng kiểm tra log hoặc thử tăng số thế hệ tối đa.")
+                    logging.error(f"Không tạo được lịch hợp lệ. schedule: {schedule}")
 
 # Tab 3: Báo cáo
 with tab3:
@@ -1478,6 +1120,30 @@ with tab3:
             df_report = pd.DataFrame(st.session_state.schedule).T
             df_report.index.name = "ID Nhân viên"
             df_report.columns = [d.strftime("%d/%m") for d in month_days]
+            weekly_stats, daily_stats, week_labels, week_indices = calculate_weekly_stats(st.session_state.schedule, st.session_state.employees, month_days)
+            weekly_work_row = {d.strftime("%d/%m"): "" for d in month_days}
+            weekly_morning_row = {d.strftime("%d/%m"): "" for d in month_days}
+            weekly_evening_row = {d.strftime("%d/%m"): "" for d in month_days}
+            weekly_off_row = {d.strftime("%d/%m"): "" for d in month_days}
+            week_index = 0
+            day_index = 0
+            for i, week in enumerate(week_indices):
+                for _ in week:
+                    if day_index < len(month_days):
+                        weekly_work_row[month_days[day_index].strftime("%d/%m")] = str(weekly_stats['work'][i]) if i == week_index else ""
+                        weekly_morning_row[month_days[day_index].strftime("%d/%m")] = str(weekly_stats['morning'][i]) if i == week_index else ""
+                        weekly_evening_row[month_days[day_index].strftime("%d/%m")] = str(weekly_stats['evening'][i]) if i == week_index else ""
+                        weekly_off_row[month_days[day_index].strftime("%d/%m")] = str(weekly_stats['off'][i]) if i == week_index else ""
+                    day_index += 1
+                week_index += 1
+            df_report.loc["Tổng ca làm/ngày"] = daily_stats['work']
+            df_report.loc["Tổng ca sáng/ngày"] = daily_stats['morning']
+            df_report.loc["Tổng ca tối/ngày"] = daily_stats['evening']
+            df_report.loc["Tổng ca nghỉ/ngày"] = daily_stats['off']
+            df_report.loc["Tổng ca làm/tuần"] = [weekly_work_row[d.strftime("%d/%m")] for d in month_days]
+            df_report.loc["Tổng ca sáng/tuần"] = [weekly_morning_row[d.strftime("%d/%m")] for d in month_days]
+            df_report.loc["Tổng ca tối/tuần"] = [weekly_evening_row[d.strftime("%d/%m")] for d in month_days]
+            df_report.loc["Tổng ca nghỉ/tuần"] = [weekly_off_row[d.strftime("%d/%m")] for d in month_days]
             csv = df_report.to_csv()
             st.download_button(
                 label="Tải báo cáo Lịch CSV",
@@ -1523,16 +1189,14 @@ with tab3:
             report_data["AL"].append(al)
             report_data["NPL"].append(npl)
         
-        df_report_detail = pd.DataFrame(report_data)
-        st.dataframe(df_report_detail, use_container_width=True)
+        df_report = pd.DataFrame(report_data)
+        st.dataframe(df_report, use_container_width=True)
         
         if st.button("Tải báo cáo chi tiết"):
-            csv = df_report_detail.to_csv(index=False)
+            csv = df_report.to_csv(index=False)
             st.download_button(
                 label="Tải báo cáo chi tiết CSV",
                 data=csv,
                 file_name=f"bao_cao_chi_tiet_{year}_{month}.csv",
                 mime="text/csv"
             )
-    else:
-        st.warning("Vui lòng tạo lịch trước khi tạo báo cáo.")
