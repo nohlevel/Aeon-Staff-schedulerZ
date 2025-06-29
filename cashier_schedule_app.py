@@ -1074,7 +1074,7 @@ if "manual_shifts" not in st.session_state:
 if "vx_min" not in st.session_state:
     st.session_state.vx_min = load_setting_from_db('vx_min', 3)
 if "max_generations" not in st.session_state:
-    st.session_state.max_generations = load_setting_from_db('max_generations', 10)
+    st.session_state.max_generations = load_setting_from_db('max_generations', 2)
 if "department_filter" not in st.session_state:
     st.session_state.department_filter = "Tất cả"
 if "selected_shifts" not in st.session_state:
