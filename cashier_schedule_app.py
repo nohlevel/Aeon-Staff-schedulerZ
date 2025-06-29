@@ -1247,6 +1247,7 @@ with tab2:
         key="shift_selector",
         help="Chọn các mã ca để sử dụng trong lịch"
     )
+    logging.info(f"Valid shifts: {st.session_state.selected_shifts or default_shifts}")
     
     _, last_day = calendar.monthrange(year, month)
     start_date = datetime(year, month, 26)
@@ -1353,6 +1354,7 @@ with tab2:
                                 st.session_state.max_morning_evening_diff
                             )
                             if violation_details:
+                                invalid_cells = {}  # Khởi tạo invalid_cells trước khi sử dụng
                                 st.error("Lịch làm việc có các vi phạm sau:\n" + "\n".join(violation_details))
                                 invalid_cells.clear()
                                 for detail in violation_details:
@@ -1366,6 +1368,7 @@ with tab2:
                                             invalid_cells[(emp_id, day)] = [detail]
                                     except:
                                         continue
+                                logging.info(f"Invalid cells: {invalid_cells}")
                             else:
                                 st.success("Lịch làm việc hợp lệ, không có vi phạm!")
                             st.rerun()
@@ -1386,6 +1389,7 @@ with tab2:
             filtered_employees, 
             month_days
         )
+        logging.info(f"Week indices: {week_indices}")
         
         # Tạo cột tuần gộp
         week_columns = []
@@ -1395,11 +1399,14 @@ with tab2:
                 start_day = week_days[0].strftime('%d/%m')
                 end_day = week_days[-1].strftime('%d/%m')
                 week_columns.append(f"Tuần {i + 1} ({start_day}-{end_day})")
+        logging.info(f"Week columns: {week_columns}")
         
         # Bao gồm cột tuần gộp trong manual_data
         manual_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + week_columns + columns}
         
         invalid_cells = {}
+        logging.info(f"Manual shifts: {st.session_state.manual_shifts}")
+        logging.info(f"Schedule: {st.session_state.schedule}")
         for emp in filtered_employees:
             emp_id = emp["ID"]
             manual_data["ID Nhân viên"].append(emp_id)
@@ -1409,20 +1416,23 @@ with tab2:
             for i, week in enumerate(week_indices):
                 week_stats = {'prd': 0, 'al': 0, 'npl': 0, 'morning': 0, 'evening': 0}
                 for day in week:
-                    shift = emp_shifts[day] if day < len(emp_shifts) else st.session_state.manual_shifts.get((emp_id, day), "")
-                    if shift:
+                    # Ưu tiên manual_shifts trước schedule
+                    shift = st.session_state.manual_shifts.get((emp_id, day), emp_shifts[day] if day < len(emp_shifts) else "")
+                    logging.info(f"Employee {emp_id}, Day {day}, Shift: {shift}")
+                    if shift:  # Chỉ kiểm tra nếu shift không rỗng
                         if shift == 'PRD':
                             week_stats['prd'] += 1
                         elif shift == 'AL':
                             week_stats['al'] += 1
                         elif shift == 'NPL':
                             week_stats['npl'] += 1
-                        elif 'S' in shift:
+                        if 'S' in shift:
                             week_stats['morning'] += 1
-                        elif 'C' in shift:
+                        if 'C' in shift:
                             week_stats['evening'] += 1
                 stats_text = f"PRD: {week_stats['prd']}, AL: {week_stats['al']}, NPL: {week_stats['npl']}, Sáng: {week_stats['morning']}, Chiều: {week_stats['evening']}"
                 manual_data[week_columns[i]].append(stats_text)
+                logging.info(f"Week stats for {emp_id}, Week {i + 1}: {stats_text}")
             # Điền ca cho các cột ngày
             for day, col in enumerate(columns):
                 shift = st.session_state.manual_shifts.get((emp_id, day), "")
