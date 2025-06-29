@@ -1074,7 +1074,7 @@ if "manual_shifts" not in st.session_state:
 if "vx_min" not in st.session_state:
     st.session_state.vx_min = load_setting_from_db('vx_min', 3)
 if "max_generations" not in st.session_state:
-    st.session_state.max_generations = load_setting_from_db('max_generations', 2)
+    st.session_state.max_generations = load_setting_from_db('max_generations', 10)
 if "department_filter" not in st.session_state:
     st.session_state.department_filter = "Tất cả"
 if "selected_shifts" not in st.session_state:
@@ -1197,25 +1197,46 @@ with tab1:
         st.dataframe(df_employees)
 
 # Tab 2: Sắp lịch
+# Tab 2: Sắp lịch
 with tab2:
-    st.subheader("Sắp lịch làm việc")
+    st.markdown(
+        """
+        <h2 style='color: #1E3A8A; font-weight: bold; margin-bottom: 20px;'>Sắp lịch làm việc</h2>
+        """,
+        unsafe_allow_html=True
+    )
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3 = st.columns([1, 1, 1.5], gap="medium")
     with col1:
-        year = st.number_input("Năm", min_value=2020, max_value=2030, value=2025, step=1)
-        month = st.number_input("Tháng", min_value=1, max_value=12, value=datetime.now().month, step=1)
+        st.markdown("<div style='background-color: #F0F5FF; padding: 15px; border-radius: 8px;'>", unsafe_allow_html=True)
+        year = st.number_input("Năm", min_value=2020, max_value=2030, value=2025, step=1, 
+                              help="Chọn năm cho lịch làm việc")
+        month = st.number_input("Tháng", min_value=1, max_value=12, value=datetime.now().month, step=1, 
+                               help="Chọn tháng cho lịch làm việc")
+        st.markdown("</div>", unsafe_allow_html=True)
     with col2:
-        st.session_state.vx_min = st.number_input("Số ca VX tối thiểu", min_value=1, value=st.session_state.vx_min, step=1)
+        st.markdown("<div style='background-color: #F0F5FF; padding: 15px; border-radius: 8px;'>", unsafe_allow_html=True)
+        st.session_state.vx_min = st.number_input("Số ca VX tối thiểu", min_value=1, value=st.session_state.vx_min, step=1, 
+                                                help="Số ca VX tối thiểu mỗi nhân viên")
         save_settings_to_db('vx_min', st.session_state.vx_min)
-        st.session_state.max_generations = st.number_input("Số thế hệ tối đa", min_value=1, max_value=100, value=st.session_state.max_generations, step=1)
+        st.session_state.max_generations = st.number_input("Số thế hệ tối đa", min_value=1, max_value=100, 
+                                                         value=st.session_state.max_generations, step=1, 
+                                                         help="Số lần thử tối đa để tạo lịch tự động")
         save_settings_to_db('max_generations', st.session_state.max_generations)
+        st.markdown("</div>", unsafe_allow_html=True)
     with col3:
+        st.markdown("<div style='background-color: #F0F5FF; padding: 15px; border-radius: 8px;'>", unsafe_allow_html=True)
         st.session_state.department_filter = st.selectbox("Bộ phận", ["Tất cả", "Cashier", "Customer Service"], 
-                                                        index=["Tất cả", "Cashier", "Customer Service"].index(st.session_state.department_filter))
-        st.session_state.balance_morning_evening = st.checkbox("Cân bằng ca Sáng-Tối", value=st.session_state.balance_morning_evening)
+                                                        index=["Tất cả", "Cashier", "Customer Service"].index(st.session_state.department_filter),
+                                                        help="Lọc nhân viên theo bộ phận")
+        st.session_state.balance_morning_evening = st.checkbox("Cân bằng ca Sáng-Tối", 
+                                                             value=st.session_state.balance_morning_evening,
+                                                             help="Đảm bảo số ca sáng và tối không lệch quá nhiều")
         if st.session_state.balance_morning_evening:
             st.session_state.max_morning_evening_diff = st.number_input("Độ lệch Sáng-Tối tối đa", min_value=0, max_value=10, 
-                                                                     value=st.session_state.max_morning_evening_diff, step=1)
+                                                                     value=st.session_state.max_morning_evening_diff, step=1,
+                                                                     help="Độ lệch tối đa giữa ca sáng và tối")
+        st.markdown("</div>", unsafe_allow_html=True)
     
     all_shifts = get_valid_shifts()
     default_shifts = get_default_shifts(st.session_state.department_filter)
@@ -1223,7 +1244,8 @@ with tab2:
         "Chọn mã ca",
         options=all_shifts + ["PRD", "AL", "NPL"],
         default=default_shifts,
-        key="shift_selector"
+        key="shift_selector",
+        help="Chọn các mã ca để sử dụng trong lịch"
     )
     
     _, last_day = calendar.monthrange(year, month)
@@ -1244,25 +1266,169 @@ with tab2:
             logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
     
     if st.session_state.show_manual_shifts:
-        st.subheader("Nhập và chỉnh sửa lịch làm việc")
-        valid_shifts = get_valid_shifts() + ["PRD", "AL", "NPL"]
-        columns = [f"{d.strftime('%a %d/%m')}" for d in month_days]
-        manual_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + columns}
+        st.markdown(
+            """
+            <h3 style='color: #1E3A8A; font-weight: bold; margin-top: 20px; margin-bottom: 10px;'>Nhập và chỉnh sửa lịch làm việc</h3>
+            <p style='color: #4B5563; font-size: 14px;'>Chọn ca từ dropdown trong bảng. Ô đỏ là ca không hợp lệ.</p>
+            """,
+            unsafe_allow_html=True
+        )
         
+        # Nút điều khiển với số thứ tự
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1], gap="small")
+        with col_btn1:
+            if st.button("1. Xóa lịch cũ", use_container_width=True, 
+                        help="Xóa toàn bộ lịch hiện tại"):
+                clear_schedule_data(month_days)
+        with col_btn2:
+            if st.button("2. Bổ sung ca cố định", use_container_width=True, 
+                        help="Bổ sung ca cố định cho bộ phận Customer Service"):
+                if not st.session_state.employees:
+                    st.error("Vui lòng xác định nhân viên trước khi bổ sung ca cố định!")
+                elif st.session_state.department_filter not in ["Customer Service", "Tất cả"]:
+                    st.error("Chỉ có thể bổ sung ca cố định cho bộ phận Customer Service hoặc Tất cả!")
+                else:
+                    is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
+                    if not is_feasible:
+                        st.error(f"Không thể bổ sung ca cố định: {reason}")
+                        logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
+                    else:
+                        new_manual_shifts, message = assign_fixed_cs_shifts(st.session_state.employees, month_days, st.session_state.manual_shifts, sundays)
+                        if new_manual_shifts:
+                            st.session_state.manual_shifts = new_manual_shifts
+                            save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
+                            st.success(message)
+                            logging.info(message)
+                            st.rerun()
+                        else:
+                            st.error("Không thể bổ sung ca cố định: " + message)
+                            logging.error("Không thể bổ sung ca cố định: " + message)
+        with col_btn3:
+            if st.button("3. Sắp lịch tự động", use_container_width=True, 
+                        help="Tạo lịch tự động dựa trên cài đặt"):
+                if not st.session_state.employees:
+                    st.error("Vui lòng xác định nhân viên trước khi tạo lịch!")
+                elif st.session_state.department_filter != "Tất cả" and not any(emp["Bộ phận"] == st.session_state.department_filter for emp in st.session_state.employees):
+                    st.error(f"Không có nhân viên thuộc bộ phận {st.session_state.department_filter}!")
+                elif not st.session_state.selected_shifts:
+                    st.error("Vui lòng chọn ít nhất một mã ca!")
+                elif not st.session_state.show_manual_shifts:
+                    st.error("Vui lòng nhập ca đăng ký hoặc bổ sung ca cố định trước khi tạo lịch!")
+                else:
+                    is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
+                    if not is_feasible:
+                        st.error(f"Không thể tạo lịch: {reason}")
+                        logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
+                    else:
+                        schedule, violations = auto_schedule(
+                            st.session_state.employees,
+                            month_days,
+                            sundays,
+                            st.session_state.vx_min,
+                            st.session_state.department_filter,
+                            st.session_state.balance_morning_evening,
+                            st.session_state.max_morning_evening_diff,
+                            st.session_state.max_generations
+                        )
+                        if schedule and any(shifts for shifts in schedule.values()):
+                            st.session_state.schedule = schedule
+                            shift_count = 0
+                            for emp_id, shifts in schedule.items():
+                                for day, shift in enumerate(shifts):
+                                    if shift and (emp_id, day) not in st.session_state.manual_shifts:
+                                        st.session_state.manual_shifts[(emp_id, day)] = shift
+                                        shift_count += 1
+                            save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
+                            save_schedule_to_db(st.session_state.schedule, month_days)
+                            logging.info(f"Đã lưu {shift_count} ca vào manual_shifts và schedule")
+                            st.success(f"Đã tạo lịch thành công với {shift_count} ca được phân bổ!")
+                            
+                            fitness, violation_details = calculate_fitness(
+                                st.session_state.schedule,
+                                st.session_state.employees,
+                                month_days,
+                                sundays,
+                                st.session_state.vx_min,
+                                st.session_state.balance_morning_evening,
+                                st.session_state.max_morning_evening_diff
+                            )
+                            if violation_details:
+                                st.error("Lịch làm việc có các vi phạm sau:\n" + "\n".join(violation_details))
+                                invalid_cells.clear()
+                                for detail in violation_details:
+                                    parts = detail.split(":")
+                                    emp_id = parts[0].strip()
+                                    day_str = parts[-1].split("ngày")[-1].strip()
+                                    try:
+                                        day = next(i for i, d in enumerate(month_days) if d.strftime('%d/%m') == day_str)
+                                        shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
+                                        if shift:
+                                            invalid_cells[(emp_id, day)] = [detail]
+                                    except:
+                                        continue
+                            else:
+                                st.success("Lịch làm việc hợp lệ, không có vi phạm!")
+                            st.rerun()
+                        else:
+                            st.error(f"Không thể tạo lịch hợp lệ sau {st.session_state.max_generations} thế hệ. Vui lòng kiểm tra log hoặc thử tăng số thế hệ tối đa.")
+                            logging.error(f"Không tạo được lịch hợp lệ. schedule: {schedule}")
+        
+        # Sử dụng selected_shifts, nếu rỗng thì lấy default_shifts
+        valid_shifts = st.session_state.selected_shifts if st.session_state.selected_shifts else default_shifts
+        columns = [f"{d.strftime('%a %d/%m')}" for d in month_days]
+        
+        # Tạo thống kê tuần trước để lấy week_indices
         filtered_employees = st.session_state.employees if st.session_state.department_filter == "Tất cả" else [
             emp for emp in st.session_state.employees if emp["Bộ phận"] == st.session_state.department_filter
         ]
+        weekly_stats, daily_stats, week_labels, week_indices = calculate_weekly_stats(
+            st.session_state.schedule or {emp["ID"]: [''] * len(month_days) for emp in filtered_employees}, 
+            filtered_employees, 
+            month_days
+        )
+        
+        # Tạo cột tuần gộp
+        week_columns = []
+        for i, week in enumerate(week_indices):
+            week_days = [month_days[j] for j in week]
+            if week_days:
+                start_day = week_days[0].strftime('%d/%m')
+                end_day = week_days[-1].strftime('%d/%m')
+                week_columns.append(f"Tuần {i + 1} ({start_day}-{end_day})")
+        
+        # Bao gồm cột tuần gộp trong manual_data
+        manual_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + week_columns + columns}
         
         invalid_cells = {}
         for emp in filtered_employees:
             emp_id = emp["ID"]
             manual_data["ID Nhân viên"].append(emp_id)
             manual_data["Họ Tên"].append(emp["Họ Tên"])
+            # Tính thống kê tuần cho nhân viên
+            emp_shifts = st.session_state.schedule.get(emp_id, [''] * len(month_days))
+            for i, week in enumerate(week_indices):
+                week_stats = {'prd': 0, 'al': 0, 'npl': 0, 'morning': 0, 'evening': 0}
+                for day in week:
+                    shift = emp_shifts[day] if day < len(emp_shifts) else st.session_state.manual_shifts.get((emp_id, day), "")
+                    if shift:
+                        if shift == 'PRD':
+                            week_stats['prd'] += 1
+                        elif shift == 'AL':
+                            week_stats['al'] += 1
+                        elif shift == 'NPL':
+                            week_stats['npl'] += 1
+                        elif 'S' in shift:
+                            week_stats['morning'] += 1
+                        elif 'C' in shift:
+                            week_stats['evening'] += 1
+                stats_text = f"PRD: {week_stats['prd']}, AL: {week_stats['al']}, NPL: {week_stats['npl']}, Sáng: {week_stats['morning']}, Chiều: {week_stats['evening']}"
+                manual_data[week_columns[i]].append(stats_text)
+            # Điền ca cho các cột ngày
             for day, col in enumerate(columns):
                 shift = st.session_state.manual_shifts.get((emp_id, day), "")
                 if not shift and emp_id in st.session_state.schedule:
                     shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
-                manual_data[col].append(shift)
+                manual_data[col].append(shift if shift in valid_shifts + [""] else "")
                 if shift and shift not in [""] and (emp_id, day) not in st.session_state.manual_shifts:
                     temp_schedule = {emp_id: ['' if i != day else shift for i in range(len(month_days))]}
                     is_valid, errors = calculate_fitness(temp_schedule, [emp], month_days, sundays, 
@@ -1271,74 +1437,78 @@ with tab2:
                     if is_valid > 0:
                         invalid_cells[(emp_id, day)] = errors
         
-        weekly_stats, daily_stats, week_labels, week_indices = calculate_weekly_stats(
-            st.session_state.schedule or {emp["ID"]: [''] * len(month_days) for emp in filtered_employees}, 
-            filtered_employees, 
-            month_days
-        )
-        
-        weekly_stats_row = {col: "" for col in ["ID Nhân viên", "Họ Tên"] + columns}
-        weekly_stats_row["ID Nhân viên"] = "Thống kê tuần"
-        
-        week_index = 0
-        day_index = 0
+        # Tạo thống kê tuần với cột gộp
+        weekly_stats_row = {"ID Nhân viên": "Thống kê tuần", "Họ Tên": ""} | {col: "" for col in week_columns + columns}
         for i, week in enumerate(week_indices):
             stats = weekly_stats[i]
             stats_text = f"PRD: {stats['prd']}, AL: {stats['al']}, NPL: {stats['npl']}, Sáng: {stats['morning']}, Chiều: {stats['evening']}"
-            for _ in week:
-                if day_index < len(columns):
-                    if i == week_index:
-                        weekly_stats_row[columns[day_index]] = stats_text
-                    day_index += 1
-            week_index += 1
+            weekly_stats_row[week_columns[i]] = stats_text
         
-        daily_off_row = {"ID Nhân viên": "Tổng ca nghỉ/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['off'][i] for i in range(len(columns))}
+        daily_off_row = {"ID Nhân viên": "Tổng ca nghỉ/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['off'][i] for i in range(len(columns))} | {col: "" for col in week_columns}
         
         df_manual = pd.DataFrame(manual_data)
         df_stats = pd.DataFrame([weekly_stats_row, daily_off_row])
         df_manual = pd.concat([df_stats.iloc[:1], df_manual, df_stats.iloc[1:]], ignore_index=True)
         
-        st.write("Nhập và chỉnh sửa lịch làm việc (ô đỏ là ca không hợp lệ):")
         column_config = {
             "ID Nhân viên": st.column_config.TextColumn(disabled=True),
             "Họ Tên": st.column_config.TextColumn(disabled=True),
         }
         for col in columns:
             column_config[col] = st.column_config.SelectboxColumn(
+                label=col,
                 options=[""] + valid_shifts,
                 default="",
                 width="small",
-                disabled=col in columns and (df_manual.index[-1:].to_list() + df_manual.index[:1].to_list())
+                disabled=False
+            )
+        for week_col in week_columns:
+            column_config[week_col] = st.column_config.TextColumn(
+                label=week_col,
+                disabled=True,
+                width="medium"
             )
         
         def style_invalid_cells(df):
             def apply_style(row):
                 styles = [''] * len(row)
-                if row["ID Nhân viên"] in ["Thống kê tuần", "Tổng ca nghỉ/ngày"]:
-                    return ['background-color: #f0f0f0'] * len(row)
+                if row["ID Nhân viên"] == "Thống kê tuần":
+                    return ['background-color: #E5E7EB; font-weight: bold; color: #1F2937; text-align: center;'] * len(row)
+                if row["ID Nhân viên"] == "Tổng ca nghỉ/ngày":
+                    return ['background-color: #E5E7EB; font-weight: bold; color: #1F2937;'] * len(row)
                 emp_id = row["ID Nhân viên"]
                 for day in range(len(columns)):
                     if (emp_id, day) in invalid_cells:
-                        styles[day + 2] = 'background-color: #ffcccc'
+                        styles[day + 2 + len(week_columns)] = 'background-color: #FECACA; color: #991B1B;'
+                for i in range(len(week_columns)):
+                    styles[i + 2] = 'background-color: #E5E7EB; color: #1F2937;'
                 return styles
             return df.style.apply(apply_style, axis=1)
         
+        # Tách riêng DataFrame cho chỉnh sửa (loại bỏ hàng thống kê và cột tuần)
+        df_editable = df_manual[~df_manual["ID Nhân viên"].isin(["Thống kê tuần", "Tổng ca nghỉ/ngày"])][["ID Nhân viên", "Họ Tên"] + columns].copy()
+        
         edited_manual_df = st.data_editor(
-            df_manual,
-            column_config=column_config,
+            df_editable,
+            column_config={k: v for k, v in column_config.items() if k in ["ID Nhân viên", "Họ Tên"] + columns},
             hide_index=True,
             use_container_width=True,
+            disabled=["ID Nhân viên", "Họ Tên"],
             key="manual_shifts_editor"
         )
         
+        # Cập nhật manual_shifts và schedule từ edited_manual_df
         for i, emp in enumerate(filtered_employees):
             emp_id = emp["ID"]
+            if i >= len(edited_manual_df):
+                continue
             for day, col in enumerate(columns):
-                new_shift = edited_manual_df.iloc[i + 1][col] if col in edited_manual_df.columns else ""
+                new_shift = edited_manual_df.iloc[i][col] if col in edited_manual_df.columns else ""
                 current_shift = st.session_state.manual_shifts.get((emp_id, day), "")
                 if not current_shift and emp_id in st.session_state.schedule:
                     current_shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
                 if new_shift != current_shift and new_shift in valid_shifts + [""]:
+                    logging.info(f"Updating shift for {emp_id} on day {day}: {current_shift} -> {new_shift}")
                     if new_shift:
                         st.session_state.manual_shifts[(emp_id, day)] = new_shift
                     elif (emp_id, day) in st.session_state.manual_shifts:
@@ -1349,101 +1519,18 @@ with tab2:
                     save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
                     save_schedule_to_db(st.session_state.schedule, month_days)
         
-        if st.button("Xóa lịch cũ"):
-            clear_schedule_data(month_days)
-        
-        if st.button("Bổ sung ca cố định"):
-            if not st.session_state.employees:
-                st.error("Vui lòng xác định nhân viên trước khi bổ sung ca cố định!")
-            elif st.session_state.department_filter not in ["Customer Service", "Tất cả"]:
-                st.error("Chỉ có thể bổ sung ca cố định cho bộ phận Customer Service hoặc Tất cả!")
-            else:
-                is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
-                if not is_feasible:
-                    st.error(f"Không thể bổ sung ca cố định: {reason}")
-                    logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
-                else:
-                    new_manual_shifts, message = assign_fixed_cs_shifts(st.session_state.employees, month_days, st.session_state.manual_shifts, sundays)
-                    if new_manual_shifts:
-                        st.session_state.manual_shifts = new_manual_shifts
-                        save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
-                        st.success(message)
-                        logging.info(message)
-                        st.rerun()
-                    else:
-                        st.error("Không thể bổ sung ca cố định: " + message)
-                        logging.error("Không thể bổ sung ca cố định: " + message)
-        
-        st.subheader("Lịch làm việc")
-        st.dataframe(style_invalid_cells(df_manual), use_container_width=True)
-    
-    if st.button("Sắp lịch tự động"):
-        if not st.session_state.employees:
-            st.error("Vui lòng xác định nhân viên trước khi tạo lịch!")
-        elif st.session_state.department_filter != "Tất cả" and not any(emp["Bộ phận"] == st.session_state.department_filter for emp in st.session_state.employees):
-            st.error(f"Không có nhân viên thuộc bộ phận {st.session_state.department_filter}!")
-        elif not st.session_state.selected_shifts:
-            st.error("Vui lòng chọn ít nhất một mã ca!")
-        elif not st.session_state.show_manual_shifts:
-            st.error("Vui lòng nhập ca đăng ký hoặc bổ sung ca cố định trước khi tạo lịch!")
-        else:
-            is_feasible, reason = check_feasibility(st.session_state.employees, month_days, st.session_state.selected_shifts)
-            if not is_feasible:
-                st.error(f"Không thể tạo lịch: {reason}")
-                logging.error(f"Kiểm tra tính khả thi thất bại: {reason}")
-            else:
-                schedule, violations = auto_schedule(
-                    st.session_state.employees,
-                    month_days,
-                    sundays,
-                    st.session_state.vx_min,
-                    st.session_state.department_filter,
-                    st.session_state.balance_morning_evening,
-                    st.session_state.max_morning_evening_diff,
-                    st.session_state.max_generations
-                )
-                if schedule and any(shifts for shifts in schedule.values()):
-                    st.session_state.schedule = schedule
-                    shift_count = 0
-                    for emp_id, shifts in schedule.items():
-                        for day, shift in enumerate(shifts):
-                            if shift and (emp_id, day) not in st.session_state.manual_shifts:
-                                st.session_state.manual_shifts[(emp_id, day)] = shift
-                                shift_count += 1
-                    save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
-                    save_schedule_to_db(st.session_state.schedule, month_days)
-                    logging.info(f"Đã lưu {shift_count} ca vào manual_shifts và schedule")
-                    st.success(f"Đã tạo lịch thành công với {shift_count} ca được phân bổ!")
-                    
-                    fitness, violation_details = calculate_fitness(
-                        st.session_state.schedule,
-                        st.session_state.employees,
-                        month_days,
-                        sundays,
-                        st.session_state.vx_min,
-                        st.session_state.balance_morning_evening,
-                        st.session_state.max_morning_evening_diff
-                    )
-                    if violation_details:
-                        st.error("Lịch làm việc có các vi phạm sau:\n" + "\n".join(violation_details))
-                        invalid_cells.clear()
-                        for detail in violation_details:
-                            parts = detail.split(":")
-                            emp_id = parts[0].strip()
-                            day_str = parts[-1].split("ngày")[-1].strip()
-                            try:
-                                day = next(i for i, d in enumerate(month_days) if d.strftime('%d/%m') == day_str)
-                                shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
-                                if shift:
-                                    invalid_cells[(emp_id, day)] = [detail]
-                            except:
-                                continue
-                    else:
-                        st.success("Lịch làm việc hợp lệ, không có vi phạm!")
-                    st.rerun()
-                else:
-                    st.error(f"Không thể tạo lịch hợp lệ sau {st.session_state.max_generations} thế hệ. Vui lòng kiểm tra log hoặc thử tăng số thế hệ tối đa.")
-                    logging.error(f"Không tạo được lịch hợp lệ. schedule: {schedule}")
+        # Hiển thị bảng đầy đủ (bao gồm hàng thống kê và cột tuần gộp) để xem
+        st.markdown(
+            """
+            <h3 style='color: #1E3A8A; font-weight: bold; margin-top: 20px; margin-bottom: 10px;'>Lịch làm việc</h3>
+            """,
+            unsafe_allow_html=True
+        )
+        st.dataframe(
+            style_invalid_cells(df_manual),
+            use_container_width=True,
+            height=400
+        )
 
 # Tab 3: Báo cáo
 with tab3:
