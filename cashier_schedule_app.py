@@ -10,6 +10,7 @@ import time
 import random
 import uuid
 import math
+import hashlib
 
 # Thiết lập tiêu đề trang
 st.set_page_config(page_title="Aeon Cashier SchedulerZ")
@@ -27,6 +28,11 @@ HOLIDAYS = [
 # Hàm kiểm tra ngày lễ
 def is_holiday(date):
     return date.strftime("%d/%m") in HOLIDAYS
+
+# Hàm kiểm tra ngày không hợp lệ cho PRD
+def is_invalid_prd_day(date):
+    day = date.day
+    return day in [5, 20] or date.weekday() in [5, 6] or is_holiday(date)
 
 # Hàm lấy danh sách mã ca mặc định theo bộ phận
 def get_default_shifts(department):
@@ -524,13 +530,12 @@ def calculate_fitness(schedule, employees, month_days, sundays, vx_min, balance_
             violations += HARD_CONSTRAINT_WEIGHT * (vx_min - vx_count)
             violation_details.append(f"{emp_id}: Số ca VX ({vx_count}) nhỏ hơn tối thiểu ({vx_min})")
         
-        # 5. PRD không vào thứ 7, chủ nhật, ngày lễ trừ khi nhập tay
+        # 5. PRD không vào thứ 7, chủ nhật, ngày lễ, ngày 5, ngày 20 trừ khi nhập tay
         for day in range(len(month_days)):
             shift = emp_schedule[day]
-            date = month_days[day]
-            if (date.weekday() in [5, 6] or is_holiday(date)) and shift == "PRD" and (emp_id, day) not in st.session_state.manual_shifts:
+            if is_invalid_prd_day(month_days[day]) and shift == "PRD" and (emp_id, day) not in st.session_state.manual_shifts:
                 violations += HARD_CONSTRAINT_WEIGHT
-                violation_details.append(f"{emp_id}: PRD vào thứ 7/chủ nhật/ngày lễ ngày {month_days[day].strftime('%d/%m')}")
+                violation_details.append(f"{emp_id}: PRD vào ngày không hợp lệ {month_days[day].strftime('%d/%m')}")
         
         # 6. AL, NPL chỉ được nhập tay
         for day in range(len(month_days)):
@@ -669,27 +674,26 @@ def local_repair(schedule, employees, month_days, sundays, vx_min, balance_morni
         if fitness == 0:
             break
         
-        # Sửa số ca PRD bằng số Chủ nhật, chỉ gán vào ngày thường
+        # Sửa số ca PRD bằng số Chủ nhật, chỉ gán vào ngày hợp lệ
         for emp in employees:
             emp_id = emp["ID"]
             emp_schedule = schedule[emp_id]
             prd_count = sum(1 for s in emp_schedule if s == "PRD")
             
-            # Xác định các ngày hợp lệ (thứ 2-6, không phải ngày lễ, không bị khóa, không có PRD trước/sau)
+            # Xác định các ngày hợp lệ (thứ 2-6, không phải ngày lễ, không phải ngày 5, 20, không bị khóa, không có PRD trước/sau)
             available_days = []
             for day in range(len(month_days)):
                 if (emp_id, day) not in st.session_state.manual_shifts and \
-                   month_days[day].weekday() not in [5, 6] and \
-                   not is_holiday(month_days[day]):
+                   not is_invalid_prd_day(month_days[day]):
                     prev_ok = day == 0 or emp_schedule[day-1] != "PRD"
                     next_ok = day == len(month_days)-1 or emp_schedule[day+1] != "PRD"
                     if prev_ok and next_ok:
                         available_days.append(day)
             
-            # Xác định các ngày không hợp lệ có PRD
+            # Xóa PRD ở các ngày không hợp lệ
             invalid_prd_days = [d for d, s in enumerate(emp_schedule) 
                                if s == "PRD" 
-                               and (month_days[d].weekday() in [5, 6] or is_holiday(month_days[d])) 
+                               and is_invalid_prd_day(month_days[d]) 
                                and (emp_id, d) not in st.session_state.manual_shifts]
             
             # Xóa PRD ở các ngày không hợp lệ
@@ -700,7 +704,7 @@ def local_repair(schedule, employees, month_days, sundays, vx_min, balance_morni
                 schedule[emp_id][day] = random.choice(shift_pool)
                 prd_count -= 1
             
-            # Nếu thiếu PRD, gán vào ngày thường
+            # Nếu thiếu PRD, gán vào ngày hợp lệ
             if prd_count < len(sundays) and available_days:
                 needed = len(sundays) - prd_count
                 new_prd_days = random.sample(available_days, min(needed, len(available_days)))
@@ -708,12 +712,11 @@ def local_repair(schedule, employees, month_days, sundays, vx_min, balance_morni
                     schedule[emp_id][day] = "PRD"
                     available_days.remove(day)
             
-            # Nếu thừa PRD, xóa ở ngày thường và gán ca khác
+            # Nếu thừa PRD, xóa ở ngày hợp lệ và gán ca khác
             elif prd_count > len(sundays):
                 valid_prd_days = [d for d, s in enumerate(emp_schedule) 
                                  if s == "PRD" 
-                                 and month_days[d].weekday() not in [5, 6] 
-                                 and not is_holiday(month_days[d]) 
+                                 and not is_invalid_prd_day(month_days[d]) 
                                  and (emp_id, d) not in st.session_state.manual_shifts]
                 excess = prd_count - len(sundays)
                 excess_days = random.sample(valid_prd_days, min(excess, len(valid_prd_days)))
@@ -845,12 +848,12 @@ def auto_schedule(employees, month_days, sundays, vx_min, department_filter, bal
         temp_schedule[emp_id][day] = ""  # Hủy gán PRD sau kiểm tra
         return True
     
-    # Xóa PRD không hợp lệ (thứ 7, Chủ nhật, ngày lễ, hoặc vi phạm ràng buộc)
+    # Xóa PRD không hợp lệ (thứ 7, Chủ nhật, ngày lễ, ngày 5, 20, hoặc vi phạm ràng buộc)
     for emp in employees:
         emp_id = emp["ID"]
         for day in range(len(month_days)):
             if (emp_id, day) in manual_shifts and manual_shifts[(emp_id, day)] == "PRD":
-                if (month_days[day].weekday() in [5, 6] or is_holiday(month_days[day])) and \
+                if is_invalid_prd_day(month_days[day]) and \
                    (emp_id, day) not in st.session_state.manual_shifts:
                     del manual_shifts[(emp_id, day)]
                     temp_schedule[emp_id][day] = ""
@@ -865,9 +868,9 @@ def auto_schedule(employees, month_days, sundays, vx_min, department_filter, bal
                         del manual_shifts[(emp_id, day)]
                         temp_schedule[emp_id][day] = ""
     
-    # Tạo danh sách ngày hợp lệ (thứ 2-6, không phải ngày lễ)
+    # Tạo danh sách ngày hợp lệ (thứ 2-6, không phải ngày lễ, không phải ngày 5, 20)
     valid_prd_days = [day for day in range(len(month_days)) 
-                      if month_days[day].weekday() not in [5, 6] and not is_holiday(month_days[day])]
+                      if not is_invalid_prd_day(month_days[day])]
     
     # Phân bổ PRD cho mỗi nhân viên
     for emp in employees:
@@ -999,7 +1002,6 @@ def auto_schedule(employees, month_days, sundays, vx_min, department_filter, bal
         progress_text.text(f"Thất bại! Không tìm được lịch hợp lệ sau {max_generations} thế hệ")
         return {}, []
 
-
 # Hàm tính thống kê số ca mỗi tuần
 def calculate_weekly_stats(schedule, filtered_employees, month_days):
     week_indices = []
@@ -1085,6 +1087,8 @@ if "max_morning_evening_diff" not in st.session_state:
     st.session_state.max_morning_evening_diff = 4
 if "show_manual_shifts" not in st.session_state:
     st.session_state.show_manual_shifts = False
+if "last_manual_shifts_hash" not in st.session_state:
+    st.session_state.last_manual_shifts_hash = None
 
 # Giao diện chính
 st.image("https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEhSz8lJuCp7hDsWteJiK7ZAvRqbJXx9NY_beQ7o-bMo_pPAIt39_Q1W4Cgidtg0DmkyfEufJwFTk6upbDx0cp_DbPG5rkWtjSrlPLF5tSJs1VdY73BgaBhzfrt58q7Xe9PhodzNUPNOT0BMRaVF6sdlV4gpnGF0DuQsPGptGPjViIs_KhytjuMtbUyJnEg/s0/logo%20ITLpro.png", width=300)
@@ -1197,7 +1201,6 @@ with tab1:
         st.dataframe(df_employees)
 
 # Tab 2: Sắp lịch
-# Tab 2: Sắp lịch
 with tab2:
     st.markdown(
         """
@@ -1247,7 +1250,6 @@ with tab2:
         key="shift_selector",
         help="Chọn các mã ca để sử dụng trong lịch"
     )
-    logging.info(f"Valid shifts: {st.session_state.selected_shifts or default_shifts}")
     
     _, last_day = calendar.monthrange(year, month)
     start_date = datetime(year, month, 26)
@@ -1354,9 +1356,8 @@ with tab2:
                                 st.session_state.max_morning_evening_diff
                             )
                             if violation_details:
-                                invalid_cells = {}  # Khởi tạo invalid_cells trước khi sử dụng
                                 st.error("Lịch làm việc có các vi phạm sau:\n" + "\n".join(violation_details))
-                                invalid_cells.clear()
+                                invalid_cells = {}  # Khởi tạo lại nếu cần
                                 for detail in violation_details:
                                     parts = detail.split(":")
                                     emp_id = parts[0].strip()
@@ -1368,7 +1369,6 @@ with tab2:
                                             invalid_cells[(emp_id, day)] = [detail]
                                     except:
                                         continue
-                                logging.info(f"Invalid cells: {invalid_cells}")
                             else:
                                 st.success("Lịch làm việc hợp lệ, không có vi phạm!")
                             st.rerun()
@@ -1376,68 +1376,27 @@ with tab2:
                             st.error(f"Không thể tạo lịch hợp lệ sau {st.session_state.max_generations} thế hệ. Vui lòng kiểm tra log hoặc thử tăng số thế hệ tối đa.")
                             logging.error(f"Không tạo được lịch hợp lệ. schedule: {schedule}")
         
+        # Khởi tạo invalid_cells
+        invalid_cells = {}
+        
         # Sử dụng selected_shifts, nếu rỗng thì lấy default_shifts
         valid_shifts = st.session_state.selected_shifts if st.session_state.selected_shifts else default_shifts
         columns = [f"{d.strftime('%a %d/%m')}" for d in month_days]
+        manual_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + columns}
         
-        # Tạo thống kê tuần trước để lấy week_indices
         filtered_employees = st.session_state.employees if st.session_state.department_filter == "Tất cả" else [
             emp for emp in st.session_state.employees if emp["Bộ phận"] == st.session_state.department_filter
         ]
-        weekly_stats, daily_stats, week_labels, week_indices = calculate_weekly_stats(
-            st.session_state.schedule or {emp["ID"]: [''] * len(month_days) for emp in filtered_employees}, 
-            filtered_employees, 
-            month_days
-        )
-        logging.info(f"Week indices: {week_indices}")
         
-        # Tạo cột tuần gộp
-        week_columns = []
-        for i, week in enumerate(week_indices):
-            week_days = [month_days[j] for j in week]
-            if week_days:
-                start_day = week_days[0].strftime('%d/%m')
-                end_day = week_days[-1].strftime('%d/%m')
-                week_columns.append(f"Tuần {i + 1} ({start_day}-{end_day})")
-        logging.info(f"Week columns: {week_columns}")
-        
-        # Bao gồm cột tuần gộp trong manual_data
-        manual_data = {col: [] for col in ["ID Nhân viên", "Họ Tên"] + week_columns + columns}
-        
-        invalid_cells = {}
-        logging.info(f"Manual shifts: {st.session_state.manual_shifts}")
-        logging.info(f"Schedule: {st.session_state.schedule}")
         for emp in filtered_employees:
             emp_id = emp["ID"]
             manual_data["ID Nhân viên"].append(emp_id)
             manual_data["Họ Tên"].append(emp["Họ Tên"])
-            # Tính thống kê tuần cho nhân viên
-            emp_shifts = st.session_state.schedule.get(emp_id, [''] * len(month_days))
-            for i, week in enumerate(week_indices):
-                week_stats = {'prd': 0, 'al': 0, 'npl': 0, 'morning': 0, 'evening': 0}
-                for day in week:
-                    # Ưu tiên manual_shifts trước schedule
-                    shift = st.session_state.manual_shifts.get((emp_id, day), emp_shifts[day] if day < len(emp_shifts) else "")
-                    logging.info(f"Employee {emp_id}, Day {day}, Shift: {shift}")
-                    if shift:  # Chỉ kiểm tra nếu shift không rỗng
-                        if shift == 'PRD':
-                            week_stats['prd'] += 1
-                        elif shift == 'AL':
-                            week_stats['al'] += 1
-                        elif shift == 'NPL':
-                            week_stats['npl'] += 1
-                        if 'S' in shift:
-                            week_stats['morning'] += 1
-                        if 'C' in shift:
-                            week_stats['evening'] += 1
-                stats_text = f"PRD: {week_stats['prd']}, AL: {week_stats['al']}, NPL: {week_stats['npl']}, Sáng: {week_stats['morning']}, Chiều: {week_stats['evening']}"
-                manual_data[week_columns[i]].append(stats_text)
-                logging.info(f"Week stats for {emp_id}, Week {i + 1}: {stats_text}")
-            # Điền ca cho các cột ngày
             for day, col in enumerate(columns):
                 shift = st.session_state.manual_shifts.get((emp_id, day), "")
                 if not shift and emp_id in st.session_state.schedule:
                     shift = st.session_state.schedule.get(emp_id, [''] * len(month_days))[day]
+                # Đảm bảo giá trị shift hợp lệ với valid_shifts
                 manual_data[col].append(shift if shift in valid_shifts + [""] else "")
                 if shift and shift not in [""] and (emp_id, day) not in st.session_state.manual_shifts:
                     temp_schedule = {emp_id: ['' if i != day else shift for i in range(len(month_days))]}
@@ -1447,18 +1406,18 @@ with tab2:
                     if is_valid > 0:
                         invalid_cells[(emp_id, day)] = errors
         
-        # Tạo thống kê tuần với cột gộp
-        weekly_stats_row = {"ID Nhân viên": "Thống kê tuần", "Họ Tên": ""} | {col: "" for col in week_columns + columns}
-        for i, week in enumerate(week_indices):
-            stats = weekly_stats[i]
-            stats_text = f"PRD: {stats['prd']}, AL: {stats['al']}, NPL: {stats['npl']}, Sáng: {stats['morning']}, Chiều: {stats['evening']}"
-            weekly_stats_row[week_columns[i]] = stats_text
+        # Tạo hàng tổng ca nghỉ/ngày
+        weekly_stats, daily_stats, week_labels, week_indices = calculate_weekly_stats(
+            st.session_state.schedule or {emp["ID"]: [''] * len(month_days) for emp in filtered_employees}, 
+            filtered_employees, 
+            month_days
+        )
         
-        daily_off_row = {"ID Nhân viên": "Tổng ca nghỉ/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['off'][i] for i in range(len(columns))} | {col: "" for col in week_columns}
+        daily_off_row = {"ID Nhân viên": "Tổng ca nghỉ/ngày", "Họ Tên": ""} | {columns[i]: daily_stats['off'][i] for i in range(len(columns))}
         
         df_manual = pd.DataFrame(manual_data)
-        df_stats = pd.DataFrame([weekly_stats_row, daily_off_row])
-        df_manual = pd.concat([df_stats.iloc[:1], df_manual, df_stats.iloc[1:]], ignore_index=True)
+        df_stats = pd.DataFrame([daily_off_row])
+        df_manual = pd.concat([df_manual, df_stats], ignore_index=True)
         
         column_config = {
             "ID Nhân viên": st.column_config.TextColumn(disabled=True),
@@ -1472,35 +1431,25 @@ with tab2:
                 width="small",
                 disabled=False
             )
-        for week_col in week_columns:
-            column_config[week_col] = st.column_config.TextColumn(
-                label=week_col,
-                disabled=True,
-                width="medium"
-            )
         
         def style_invalid_cells(df):
             def apply_style(row):
                 styles = [''] * len(row)
-                if row["ID Nhân viên"] == "Thống kê tuần":
-                    return ['background-color: #E5E7EB; font-weight: bold; color: #1F2937; text-align: center;'] * len(row)
                 if row["ID Nhân viên"] == "Tổng ca nghỉ/ngày":
                     return ['background-color: #E5E7EB; font-weight: bold; color: #1F2937;'] * len(row)
                 emp_id = row["ID Nhân viên"]
                 for day in range(len(columns)):
                     if (emp_id, day) in invalid_cells:
-                        styles[day + 2 + len(week_columns)] = 'background-color: #FECACA; color: #991B1B;'
-                for i in range(len(week_columns)):
-                    styles[i + 2] = 'background-color: #E5E7EB; color: #1F2937;'
+                        styles[day + 2] = 'background-color: #FECACA; color: #991B1B;'
                 return styles
             return df.style.apply(apply_style, axis=1)
         
-        # Tách riêng DataFrame cho chỉnh sửa (loại bỏ hàng thống kê và cột tuần)
-        df_editable = df_manual[~df_manual["ID Nhân viên"].isin(["Thống kê tuần", "Tổng ca nghỉ/ngày"])][["ID Nhân viên", "Họ Tên"] + columns].copy()
+        # Tách riêng DataFrame cho chỉnh sửa (loại bỏ hàng thống kê)
+        df_editable = df_manual[df_manual["ID Nhân viên"] != "Tổng ca nghỉ/ngày"][["ID Nhân viên", "Họ Tên"] + columns].copy()
         
         edited_manual_df = st.data_editor(
             df_editable,
-            column_config={k: v for k, v in column_config.items() if k in ["ID Nhân viên", "Họ Tên"] + columns},
+            column_config=column_config,
             hide_index=True,
             use_container_width=True,
             disabled=["ID Nhân viên", "Họ Tên"],
@@ -1529,7 +1478,7 @@ with tab2:
                     save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
                     save_schedule_to_db(st.session_state.schedule, month_days)
         
-        # Hiển thị bảng đầy đủ (bao gồm hàng thống kê và cột tuần gộp) để xem
+        # Hiển thị bảng đầy đủ (bao gồm hàng tổng ca nghỉ/ngày) để xem
         st.markdown(
             """
             <h3 style='color: #1E3A8A; font-weight: bold; margin-top: 20px; margin-bottom: 10px;'>Lịch làm việc</h3>
@@ -1541,7 +1490,6 @@ with tab2:
             use_container_width=True,
             height=400
         )
-
 # Tab 3: Báo cáo
 with tab3:
     st.subheader("Báo cáo")
