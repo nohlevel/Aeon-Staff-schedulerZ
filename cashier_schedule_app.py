@@ -1093,9 +1093,19 @@ if "last_manual_shifts_hash" not in st.session_state:
 # Giao diện chính
 st.image("https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEhSz8lJuCp7hDsWteJiK7ZAvRqbJXx9NY_beQ7o-bMo_pPAIt39_Q1W4Cgidtg0DmkyfEufJwFTk6upbDx0cp_DbPG5rkWtjSrlPLF5tSJs1VdY73BgaBhzfrt58q7Xe9PhodzNUPNOT0BMRaVF6sdlV4gpnGF0DuQsPGptGPjViIs_KhytjuMtbUyJnEg/s0/logo%20ITLpro.png", width=300)
 st.title("Aeon Cashier SchedulerZ")
-
+# Khởi tạo month_days mặc định
+if "year" not in st.session_state:
+    st.session_state.year = datetime.now().year
+if "month" not in st.session_state:
+    st.session_state.month = datetime.now().month
+if "month_days" not in st.session_state:
+    _, last_day = calendar.monthrange(st.session_state.year, st.session_state.month)
+    start_date = datetime(st.session_state.year, st.session_state.month, 26)
+    end_date = datetime(st.session_state.year, st.session_state.month + 1, 25) if st.session_state.month < 12 else datetime(st.session_state.year + 1, 1, 25)
+    st.session_state.month_days = [start_date + timedelta(days=x) for x in range((end_date - start_date).days + 1)]
 # Khai báo các tab
 tab1, tab2, tab3 = st.tabs(["Quản lý nhân viên", "Sắp lịch", "Báo cáo"])
+
 
 # Tab 1: Quản lý nhân viên
 with tab1:
@@ -1137,23 +1147,47 @@ with tab1:
                 mime="text/csv"
             )
     
+    # Khởi tạo các biến session_state cho trường nhập liệu
+    if "emp_id_input" not in st.session_state:
+        st.session_state.emp_id_input = ""
+    if "emp_name_input" not in st.session_state:
+        st.session_state.emp_name_input = ""
+    if "emp_rank_input" not in st.session_state:
+        st.session_state.emp_rank_input = "Junior"
+    if "emp_department_input" not in st.session_state:
+        st.session_state.emp_department_input = "Cashier"
+    
     st.subheader("Thêm nhân viên thủ công")
     with st.form("employee_form"):
-        emp_id = st.text_input("ID nhân viên")
-        emp_name = st.text_input("Họ Tên")
-        emp_rank = st.selectbox("Cấp bậc", ["Junior", "Senior", "Manager"], key="add_rank")
-        emp_department = st.selectbox("Bộ phận", ["Cashier", "Customer Service"], key="add_department")
+        st.session_state.emp_id_input = st.text_input("ID nhân viên", 
+                                                     value=st.session_state.emp_id_input,
+                                                     key="add_id")
+        st.session_state.emp_name_input = st.text_input("Họ Tên", 
+                                                       value=st.session_state.emp_name_input,
+                                                       key="add_name")
+        st.session_state.emp_rank_input = st.selectbox("Cấp bậc", 
+                                                      ["Junior", "Senior", "Manager"], 
+                                                      index=["Junior", "Senior", "Manager"].index(st.session_state.emp_rank_input),
+                                                      key="add_rank")
+        st.session_state.emp_department_input = st.selectbox("Bộ phận", 
+                                                            ["Cashier", "Customer Service"], 
+                                                            index=["Cashier", "Customer Service"].index(st.session_state.emp_department_input),
+                                                            key="add_department")
         submitted = st.form_submit_button("Thêm nhân viên")
-        if submitted and emp_id and emp_name:
-            if emp_id not in [emp["ID"] for emp in st.session_state.employees]:
+        if submitted and st.session_state.emp_id_input and st.session_state.emp_name_input:
+            if st.session_state.emp_id_input not in [emp["ID"] for emp in st.session_state.employees]:
                 st.session_state.employees.append({
-                    "ID": emp_id,
-                    "Họ Tên": emp_name,
-                    "Cấp bậc": emp_rank,
-                    "Bộ phận": emp_department
+                    "ID": st.session_state.emp_id_input,
+                    "Họ Tên": st.session_state.emp_name_input,
+                    "Cấp bậc": st.session_state.emp_rank_input,
+                    "Bộ phận": st.session_state.emp_department_input
                 })
                 save_employees_to_db()
-                st.success(f"Đã thêm nhân viên {emp_name}")
+                st.success(f"Đã thêm nhân viên {st.session_state.emp_name_input}")
+                logging.info(f"Added employee: {st.session_state.emp_id_input} - {st.session_state.emp_name_input}")
+                # Xóa trắng trường ID và Họ Tên sau khi thêm thành công
+                st.session_state.emp_id_input = ""
+                st.session_state.emp_name_input = ""
             else:
                 st.error("ID nhân viên đã tồn tại!")
     
@@ -1189,8 +1223,8 @@ with tab1:
                                     (edit_emp_id if k[0] == selected_emp_id else k[0], k[1]): v 
                                     for k, v in st.session_state.manual_shifts.items()
                                 }
-                                save_schedule_to_db(st.session_state.schedule, month_days)
-                                save_manual_shifts_to_db(st.session_state.manual_shifts, month_days)
+                                save_schedule_to_db(st.session_state.schedule, st.session_state.month_days)
+                                save_manual_shifts_to_db(st.session_state.manual_shifts, st.session_state.month_days)
                             break
                     save_employees_to_db()
                     st.success(f"Đã cập nhật thông tin nhân viên {edit_emp_name}")
@@ -1198,7 +1232,35 @@ with tab1:
     if st.session_state.employees:
         st.subheader("Danh sách nhân viên")
         df_employees = pd.DataFrame(st.session_state.employees)
-        st.dataframe(df_employees)
+        st.dataframe(df_employees, use_container_width=True)
+        
+        st.markdown("### Xóa nhân viên")
+        employee_options = [f"{emp['ID']} - {emp['Họ Tên']} ({emp['Bộ phận']})" for emp in st.session_state.employees]
+        selected_employee = st.selectbox("Chọn nhân viên để xóa", 
+                                        [""] + employee_options,
+                                        index=0,
+                                        key="delete_employee_selector")
+        col1, col2, col3 = st.columns([1, 1, 3])
+        with col1:
+            if st.button("Xóa nhân viên", use_container_width=True):
+                if not selected_employee:
+                    st.error("Vui lòng chọn nhân viên để xóa!")
+                else:
+                    emp_id = selected_employee.split(" - ")[0]
+                    emp_name = selected_employee.split(" - ")[1].split(" (")[0]
+                    st.session_state.employees = [emp for emp in st.session_state.employees if emp["ID"] != emp_id]
+                    # Xóa ca liên quan trong schedule và manual_shifts
+                    if emp_id in st.session_state.schedule:
+                        del st.session_state.schedule[emp_id]
+                    st.session_state.manual_shifts = {
+                        k: v for k, v in st.session_state.manual_shifts.items() if k[0] != emp_id
+                    }
+                    save_employees_to_db()
+                    save_schedule_to_db(st.session_state.schedule, st.session_state.month_days)
+                    save_manual_shifts_to_db(st.session_state.manual_shifts, st.session_state.month_days)
+                    st.success(f"Đã xóa nhân viên {emp_name} thành công!")
+                    logging.info(f"Deleted employee: {emp_id} - {emp_name}")
+                    st.rerun()
 
 # Tab 2: Sắp lịch
 with tab2:
